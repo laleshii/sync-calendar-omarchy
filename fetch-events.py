@@ -16,8 +16,13 @@ import calendar
 import urllib.request
 import urllib.parse
 import urllib.error
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover - Python < 3.9
+    ZoneInfo = None
 
 CONFIG_PATH = os.path.expanduser("~/.config/omarchy/calendars.json")
 STATE_DIR = os.path.expanduser("~/.local/state/omarchy")
@@ -262,9 +267,100 @@ def unescape_ical_text(val):
     return val.strip()
 
 
+# Common Windows/Exchange TZID names that are not IANA identifiers.
+WINDOWS_TZ_ALIASES = {
+    "EASTERN STANDARD TIME": "America/New_York",
+    "CENTRAL STANDARD TIME": "America/Chicago",
+    "MOUNTAIN STANDARD TIME": "America/Denver",
+    "US MOUNTAIN STANDARD TIME": "America/Phoenix",
+    "PACIFIC STANDARD TIME": "America/Los_Angeles",
+    "ALASKAN STANDARD TIME": "America/Anchorage",
+    "HAWAIIAN STANDARD TIME": "Pacific/Honolulu",
+    "ATLANTIC STANDARD TIME": "America/Halifax",
+    "GMT STANDARD TIME": "Europe/London",
+    "GREENWICH STANDARD TIME": "Atlantic/Reykjavik",
+    "W. EUROPE STANDARD TIME": "Europe/Berlin",
+    "CENTRAL EUROPE STANDARD TIME": "Europe/Budapest",
+    "CENTRAL EUROPEAN STANDARD TIME": "Europe/Warsaw",
+    "ROMANCE STANDARD TIME": "Europe/Paris",
+    "E. EUROPE STANDARD TIME": "Europe/Bucharest",
+    "FLE STANDARD TIME": "Europe/Kiev",
+    "GTB STANDARD TIME": "Europe/Athens",
+    "RUSSIAN STANDARD TIME": "Europe/Moscow",
+    "INDIA STANDARD TIME": "Asia/Kolkata",
+    "CHINA STANDARD TIME": "Asia/Shanghai",
+    "SINGAPORE STANDARD TIME": "Asia/Singapore",
+    "TOKYO STANDARD TIME": "Asia/Tokyo",
+    "KOREA STANDARD TIME": "Asia/Seoul",
+    "AUS EASTERN STANDARD TIME": "Australia/Sydney",
+    "NEW ZEALAND STANDARD TIME": "Pacific/Auckland",
+    "UTC": "UTC",
+}
+
+_zone_cache = {}
+
+
+def resolve_timezone(tzid):
+    """
+    Resolve an iCal TZID value to a tzinfo object, or None when it is unknown.
+    Handles quoted names, prefixed forms (/mozilla.org/.../America/New_York)
+    and the common Windows/Exchange zone names.
+    """
+    if not tzid or ZoneInfo is None:
+        return None
+
+    key = tzid.strip().strip('"')
+    if not key:
+        return None
+    if key in _zone_cache:
+        return _zone_cache[key]
+
+    candidates = [key]
+    if "/" in key:
+        parts = [part for part in key.split("/") if part]
+        if len(parts) >= 2:
+            candidates.append("/".join(parts[-2:]))
+        if parts:
+            candidates.append(parts[-1])
+    alias = WINDOWS_TZ_ALIASES.get(key.upper())
+    if alias:
+        candidates.append(alias)
+
+    zone = None
+    for cand in candidates:
+        try:
+            zone = ZoneInfo(cand)
+            break
+        except Exception:
+            continue
+
+    _zone_cache[key] = zone
+    return zone
+
+
+def to_local_naive(dt, tz):
+    """Interpret naive dt as being in tz, then re-express it as local wall time."""
+    try:
+        return dt.replace(tzinfo=tz).astimezone().replace(tzinfo=None)
+    except Exception:
+        return dt
+
+
+def extract_tzid(params):
+    """Return the TZID parameter value from a property's parameter list."""
+    for param in params or []:
+        if param.upper().startswith("TZID="):
+            return param.split("=", 1)[1]
+    return None
+
+
 def parse_datetime_value(val_str, params=None):
     """
-    Parse an iCal date or datetime string.
+    Parse an iCal date or datetime string into local wall time.
+
+    UTC values (trailing Z), explicit numeric offsets and TZID=... parameters are
+    all converted to the system timezone. Floating values (no zone information)
+    are kept as-is, per RFC 5545.
     Returns: (is_all_day: bool, dt: datetime)
     """
     val_str = val_str.strip()
@@ -283,13 +379,28 @@ def parse_datetime_value(val_str, params=None):
         except ValueError:
             pass
 
+    # Capture the zone marker before it is stripped off for parsing
+    is_utc = val_str.endswith("Z")
+    offset_match = re.search(r"([+-])(\d\d):?(\d\d)$", val_str)
+
     # Try datetime formats: 20260816T143000Z or 20260816T143000
     cleaned = re.sub(r"[+-]\d\d:?\d\d$", "", val_str).rstrip("Z")
     for fmt in ("%Y%m%dT%H%M%S", "%Y%m%dT%H%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
         try:
-            return False, datetime.strptime(cleaned[:19], fmt)
+            dt = datetime.strptime(cleaned[:19], fmt)
         except ValueError:
-            pass
+            continue
+
+        if is_utc:
+            return False, to_local_naive(dt, timezone.utc)
+        if offset_match:
+            sign = -1 if offset_match.group(1) == "-" else 1
+            delta = timedelta(hours=int(offset_match.group(2)), minutes=int(offset_match.group(3)))
+            return False, to_local_naive(dt, timezone(sign * delta))
+        zone = resolve_timezone(extract_tzid(params))
+        if zone is not None:
+            return False, to_local_naive(dt, zone)
+        return False, dt
 
     try:
         d = datetime.strptime(val_str[:8], "%Y%m%d").date()
@@ -897,12 +1008,11 @@ def fetch_google_api_calendar(cal_info, window_start, window_end):
                 end_dt = datetime.strptime(end_info.get("date", d_str)[:10], "%Y-%m-%d") if "date" in end_info else start_dt + timedelta(days=1)
             elif "dateTime" in start_info:
                 all_day = False
-                dt_str = start_info["dateTime"]
-                cleaned = re.sub(r"[+-]\d\d:\d\d$", "", dt_str).rstrip("Z")
-                start_dt = datetime.strptime(cleaned[:19], "%Y-%m-%dT%H:%M:%S")
+                start_params = ["TZID=" + start_info["timeZone"]] if start_info.get("timeZone") else None
+                _, start_dt = parse_datetime_value(start_info["dateTime"], start_params)
                 if "dateTime" in end_info:
-                    end_cleaned = re.sub(r"[+-]\d\d:\d\d$", "", end_info["dateTime"]).rstrip("Z")
-                    end_dt = datetime.strptime(end_cleaned[:19], "%Y-%m-%dT%H:%M:%S")
+                    end_params = ["TZID=" + end_info["timeZone"]] if end_info.get("timeZone") else None
+                    _, end_dt = parse_datetime_value(end_info["dateTime"], end_params)
                 else:
                     end_dt = start_dt + timedelta(hours=1)
             else:
@@ -1047,23 +1157,26 @@ def parse_iso_duration(duration_str):
     return timedelta(hours=1)
 
 
-def parse_jmap_datetime(dt_str):
+def parse_jmap_datetime(dt_str, tzid=None):
     """
-    Parses ISO 8601 date or datetime string into naive datetime.
+    Parses a JSCalendar LocalDateTime (or ISO 8601 value) into local wall time.
+    JMAP carries the zone separately in the event's timeZone property; a null
+    timeZone means a floating time and is left untouched.
     """
     if not dt_str:
         return datetime.now()
-    cleaned = re.sub(r"[+-]\d\d:\d\d$", "", str(dt_str)).rstrip("Z")
+    cleaned = re.sub(r"[+-]\d\d:?\d\d$", "", str(dt_str)).rstrip("Z")
     if len(cleaned) == 10:  # YYYY-MM-DD
         try:
             return datetime.strptime(cleaned, "%Y-%m-%d")
         except Exception:
             pass
-    if len(cleaned) >= 19:
-        try:
-            return datetime.strptime(cleaned[:19], "%Y-%m-%dT%H:%M:%S")
-        except Exception:
-            pass
+
+    params = ["TZID=" + tzid] if tzid else None
+    is_all_day, dt = parse_datetime_value(str(dt_str), params)
+    if not is_all_day:
+        return dt
+
     try:
         return datetime.fromisoformat(cleaned)
     except Exception:
@@ -1317,13 +1430,13 @@ def fetch_jmap_calendar(cal_info, window_start, window_end):
             if not start_str:
                 continue
 
-            start_dt = parse_jmap_datetime(start_str)
+            start_dt = parse_jmap_datetime(start_str, item.get("timeZone"))
 
             if item.get("duration"):
                 dur = parse_iso_duration(item.get("duration"))
                 end_dt = start_dt + dur
             elif item.get("end"):
-                end_dt = parse_jmap_datetime(item.get("end"))
+                end_dt = parse_jmap_datetime(item.get("end"), item.get("timeZone"))
             elif all_day:
                 end_dt = start_dt + timedelta(days=1)
             else:
