@@ -941,8 +941,317 @@ def fetch_calendar(cal_info, window_start, window_end):
         }
 
 
+def parse_iso_duration(duration_str):
+    """
+    Parses ISO 8601 duration strings like 'PT1H30M', 'P1D', 'PT45M', etc. into a timedelta.
+    """
+    if not duration_str or not isinstance(duration_str, str):
+        return timedelta(hours=1)
+
+    match = re.match(
+        r'^P(?:(?P<days>\d+)D)?(?:T(?:(?P<hours>\d+)H)?(?:(?P<minutes>\d+)M)?(?:(?P<seconds>\d+)S)?)?$',
+        duration_str
+    )
+    if match:
+        parts = match.groupdict()
+        days = int(parts["days"]) if parts.get("days") else 0
+        hours = int(parts["hours"]) if parts.get("hours") else 0
+        minutes = int(parts["minutes"]) if parts.get("minutes") else 0
+        seconds = int(parts["seconds"]) if parts.get("seconds") else 0
+        td = timedelta(days=days, hours=hours, minutes=minutes, seconds=seconds)
+        if td.total_seconds() > 0:
+            return td
+
+    w_match = re.match(r'^P(?P<weeks>\d+)W$', duration_str)
+    if w_match:
+        return timedelta(weeks=int(w_match.group("weeks")))
+
+    return timedelta(hours=1)
+
+
+def parse_jmap_datetime(dt_str):
+    """
+    Parses ISO 8601 date or datetime string into naive datetime.
+    """
+    if not dt_str:
+        return datetime.now()
+    cleaned = re.sub(r"[+-]\d\d:\d\d$", "", str(dt_str)).rstrip("Z")
+    if len(cleaned) == 10:  # YYYY-MM-DD
+        try:
+            return datetime.strptime(cleaned, "%Y-%m-%d")
+        except Exception:
+            pass
+    if len(cleaned) >= 19:
+        try:
+            return datetime.strptime(cleaned[:19], "%Y-%m-%dT%H:%M:%S")
+        except Exception:
+            pass
+    try:
+        return datetime.fromisoformat(cleaned)
+    except Exception:
+        return datetime.now()
+
+
+def fetch_jmap_calendar(cal_info, window_start, window_end):
+    """
+    Fetches calendar events from a JMAP server (RFC 8620, RFC 9670, RFC 8984 JSCalendar).
+    Compatible with Fastmail, Stalwart, Cyrus IMAP, Apache James, and generic JMAP servers.
+    """
+    name = cal_info.get("name", "JMAP Calendar")
+    color = cal_info.get("color", "#ff7700")
+    token = (cal_info.get("jmapToken") or cal_info.get("token") or cal_info.get("bearerToken") or "").strip()
+    session_url = (cal_info.get("jmapUrl") or cal_info.get("sessionUrl") or cal_info.get("url") or "").strip()
+
+    if not session_url:
+        session_url = "https://api.fastmail.com/jmap/session"
+    elif not session_url.startswith("http://") and not session_url.startswith("https://"):
+        session_url = "https://" + session_url
+
+    # Auto-resolve hostnames to .well-known/jmap if no path specified
+    parsed = urllib.parse.urlparse(session_url)
+    if not parsed.path or parsed.path == "/":
+        session_url = urllib.parse.urlunparse(parsed._replace(path="/.well-known/jmap"))
+
+    if not token:
+        return {
+            "name": name,
+            "color": color,
+            "events": [],
+            "status": "auth_required: no JMAP token configured",
+            "count": 0,
+        }
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        # Step 1: Session Discovery
+        req = urllib.request.Request(session_url, headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            raw_session = safe_read_bytes(resp, max_bytes=MAX_API_BYTES)
+            session_data = json.loads(raw_session.decode("utf-8"))
+
+        api_url = session_data.get("apiUrl")
+        if not api_url:
+            return {
+                "name": name,
+                "color": color,
+                "events": [],
+                "status": "error: no apiUrl in JMAP session response",
+                "count": 0,
+            }
+
+        # Find account supporting calendars
+        accounts = session_data.get("accounts", {})
+        primary_accounts = session_data.get("primaryAccounts", {})
+        account_id = primary_accounts.get("urn:ietf:params:jmap:calendars")
+
+        if not account_id:
+            for acc_id, acc_val in accounts.items():
+                caps = acc_val.get("accountCapabilities", {})
+                if any("calendar" in k.lower() for k in caps.keys()):
+                    account_id = acc_id
+                    break
+
+        if not account_id and accounts:
+            account_id = next(iter(accounts.keys()))
+
+        if not account_id:
+            return {
+                "name": name,
+                "color": color,
+                "events": [],
+                "status": "error: no JMAP calendar account found",
+                "count": 0,
+            }
+
+        # Step 2: Query and Get Events
+        time_min = window_start.strftime("%Y-%m-%dT00:00:00Z")
+        time_max = window_end.strftime("%Y-%m-%dT23:59:59Z")
+
+        cal_filter = {
+            "after": time_min,
+            "before": time_max,
+        }
+
+        cal_id = cal_info.get("jmapCalendarId") or cal_info.get("calendarId")
+        if cal_id and cal_id != "primary":
+            cal_filter["inCalendars"] = [cal_id]
+
+        jmap_using = ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:calendars"]
+        session_caps = session_data.get("capabilities", {})
+        for cap in session_caps:
+            if "calendar" in cap.lower() and cap not in jmap_using:
+                jmap_using.append(cap)
+
+        query_call = {
+            "accountId": account_id,
+            "filter": cal_filter,
+            "expandRecurrences": True,
+        }
+
+        payload = {
+            "using": jmap_using,
+            "methodCalls": [
+                [
+                    "CalendarEvent/query",
+                    query_call,
+                    "q0"
+                ],
+                [
+                    "CalendarEvent/get",
+                    {
+                        "accountId": account_id,
+                        "#ids": {
+                            "resultOf": "q0",
+                            "name": "CalendarEvent/query",
+                            "path": "/ids"
+                        }
+                    },
+                    "get0"
+                ]
+            ]
+        }
+
+        payload_bytes = json.dumps(payload).encode("utf-8")
+        post_req = urllib.request.Request(api_url, data=payload_bytes, headers=headers, method="POST")
+
+        with urllib.request.urlopen(post_req, timeout=15) as resp:
+            raw_data = safe_read_bytes(resp, max_bytes=MAX_API_BYTES)
+            response_data = json.loads(raw_data.decode("utf-8"))
+
+        method_responses = response_data.get("methodResponses", [])
+        raw_events = []
+        for resp_name, resp_args, resp_call_id in method_responses:
+            if resp_name == "CalendarEvent/get":
+                raw_events = resp_args.get("list", [])
+                break
+            elif resp_name == "error":
+                return {
+                    "name": name,
+                    "color": color,
+                    "events": [],
+                    "status": f"jmap_error: {resp_args.get('type', 'unknown')}",
+                    "count": 0,
+                }
+
+        # Step 3: Parse JSCalendar (RFC 8984) events
+        auto_translate = cal_info.get("translateKorean", False)
+        events = []
+
+        for item in raw_events:
+            if item.get("status") == "cancelled":
+                continue
+
+            title = item.get("title") or item.get("summary") or "(Untitled Event)"
+            description = item.get("description") or ""
+
+            # Parse location(s)
+            location = ""
+            locs = item.get("locations", {})
+            if isinstance(locs, dict):
+                loc_names = [v.get("name", "") for v in locs.values() if isinstance(v, dict) and v.get("name")]
+                location = ", ".join(filter(None, loc_names))
+            elif isinstance(locs, str):
+                location = locs
+
+            if auto_translate:
+                title = translate_korean_to_english(title)
+                location = translate_korean_to_english(location)
+
+            # Detect meeting URL from virtualLocations or text
+            meeting_url = ""
+            meeting_provider = ""
+            vlocs = item.get("virtualLocations", {})
+            if isinstance(vlocs, dict):
+                for vl in vlocs.values():
+                    if isinstance(vl, dict) and vl.get("uri"):
+                        u = vl.get("uri")
+                        _, prov = extract_meeting_info(u, "", "")
+                        if prov:
+                            meeting_url = u
+                            meeting_provider = prov
+                            break
+                        elif not meeting_url:
+                            meeting_url = u
+                            meeting_provider = "Online Meeting"
+
+            if not meeting_url:
+                meeting_url, meeting_provider = extract_meeting_info(location, description, title)
+
+            all_day = bool(item.get("showWithoutTime"))
+            start_str = item.get("start")
+            if not start_str:
+                continue
+
+            start_dt = parse_jmap_datetime(start_str)
+
+            if item.get("duration"):
+                dur = parse_iso_duration(item.get("duration"))
+                end_dt = start_dt + dur
+            elif item.get("end"):
+                end_dt = parse_jmap_datetime(item.get("end"))
+            elif all_day:
+                end_dt = start_dt + timedelta(days=1)
+            else:
+                end_dt = start_dt + timedelta(hours=1)
+
+            evt = {
+                "id": item.get("id", f"jmap_{int(start_dt.timestamp())}"),
+                "title": title,
+                "location": location,
+                "description": description,
+                "calendar": name,
+                "color": color,
+                "all_day": all_day,
+                "start_dt": start_dt,
+                "end_dt": end_dt,
+                "date_key": start_dt.strftime("%Y-%m-%d"),
+                "meetingUrl": meeting_url or "",
+                "meetingProvider": meeting_provider or "",
+                "rrule": None,
+                "exdates": [],
+            }
+
+            multidays = expand_multiday_event(evt, window_start, window_end)
+            events.extend(multidays)
+
+        return {
+            "name": name,
+            "color": color,
+            "events": events,
+            "status": "ok",
+            "count": len(events),
+        }
+
+    except urllib.error.HTTPError as e:
+        status_msg = f"auth_failed ({e.code})" if e.code in (401, 403) else f"http_error ({e.code})"
+        return {
+            "name": name,
+            "color": color,
+            "events": [],
+            "status": status_msg,
+            "count": 0,
+        }
+    except Exception as e:
+        return {
+            "name": name,
+            "color": color,
+            "events": [],
+            "status": f"error: {str(e)}",
+            "count": 0,
+        }
+
+
 def fetch_calendar_item(cal_info, window_start, window_end):
-    if cal_info.get("googleCalendarId") or cal_info.get("calendarId"):
+    cal_type = str(cal_info.get("type", "")).lower()
+    if cal_type == "jmap" or cal_info.get("jmapToken") or ("jmap" in cal_info.get("url", "").lower() and "jmapToken" in cal_info):
+        return fetch_jmap_calendar(cal_info, window_start, window_end)
+    elif cal_info.get("googleCalendarId") or (cal_info.get("calendarId") and not cal_info.get("jmapToken")):
         return fetch_google_api_calendar(cal_info, window_start, window_end)
     else:
         return fetch_calendar(cal_info, window_start, window_end)
@@ -989,7 +1298,13 @@ def main():
 
     enabled_cals = [
         c for c in calendars
-        if c.get("enabled", True) and (c.get("url") or c.get("googleCalendarId") or c.get("calendarId"))
+        if c.get("enabled", True) and (
+            c.get("url") or
+            c.get("googleCalendarId") or
+            c.get("calendarId") or
+            c.get("jmapToken") or
+            c.get("type") == "jmap"
+        )
     ]
 
     all_events = []

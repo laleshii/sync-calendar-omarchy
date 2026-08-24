@@ -63,8 +63,10 @@ Panel {
 
   property bool addingCalendar: false
   property string formName: ""
-  property string formType: "url" // "url" or "googleId"
+  property string formType: "url" // "url", "googleId", "jmap"
   property string formAddress: ""
+  property string formJmapUrl: ""
+  property string formJmapToken: ""
   property string formColor: "#4285f4"
 
   function openSettings(tab) {
@@ -119,12 +121,14 @@ Panel {
     formName = ""
     formType = type || "url"
     formAddress = ""
-    formColor = formType === "googleId" ? "#e01b24" : "#4285f4"
+    formJmapUrl = "https://api.fastmail.com/jmap/session"
+    formJmapToken = ""
+    formColor = formType === "googleId" ? "#e01b24" : (formType === "jmap" ? "#ff7700" : "#4285f4")
     addingCalendar = true
   }
 
   function commitNewCalendar() {
-    if (!formName.trim() || !formAddress.trim()) return
+    if (!formName.trim()) return
     var list = JSON.parse(JSON.stringify(root.configuredCalendars))
     var item = {
       name: formName.trim(),
@@ -132,8 +136,18 @@ Panel {
       enabled: true
     }
     if (formType === "googleId") {
+      if (!formAddress.trim()) return
       item.googleCalendarId = formAddress.trim()
+    } else if (formType === "jmap") {
+      if (!formJmapToken.trim()) return
+      item.type = "jmap"
+      item.jmapUrl = formJmapUrl.trim() || "https://api.fastmail.com/jmap/session"
+      item.jmapToken = formJmapToken.trim()
+      if (formAddress.trim()) {
+        item.calendarId = formAddress.trim()
+      }
     } else {
+      if (!formAddress.trim()) return
       item.url = formAddress.trim()
     }
     list.push(item)
@@ -1752,7 +1766,7 @@ Panel {
                 font.letterSpacing: 1
               }
 
-              // Type Selector: iCal URL vs Google API ID
+              // Type Selector: iCal URL vs Google API ID vs JMAP
               Row {
                 spacing: Style.space(8)
 
@@ -1778,7 +1792,10 @@ Panel {
                   MouseArea {
                     anchors.fill: parent
                     cursorShape: Qt.PointingHandCursor
-                    onClicked: root.formType = "url"
+                    onClicked: {
+                      root.formType = "url"
+                      root.formColor = "#4285f4"
+                    }
                   }
                 }
 
@@ -1804,7 +1821,39 @@ Panel {
                   MouseArea {
                     anchors.fill: parent
                     cursorShape: Qt.PointingHandCursor
-                    onClicked: root.formType = "googleId"
+                    onClicked: {
+                      root.formType = "googleId"
+                      root.formColor = "#e01b24"
+                    }
+                  }
+                }
+
+                Rectangle {
+                  width: typeJmapText.implicitWidth + Style.space(14)
+                  height: Style.space(24)
+                  radius: Style.cornerRadius
+                  color: root.formType === "jmap" ? Color.accent : "transparent"
+                  border.width: root.formType === "jmap" ? 0 : Style.spacing.hairline
+                  border.color: Qt.darker(root.contentForeground, 1.8)
+
+                  Text {
+                    textFormat: Text.PlainText
+                    id: typeJmapText
+                    anchors.centerIn: parent
+                    text: "JMAP"
+                    color: root.formType === "jmap" ? Color.background : root.contentForeground
+                    font.family: root.contentFontFamily
+                    font.pixelSize: Style.font.caption
+                    font.bold: root.formType === "jmap"
+                  }
+
+                  MouseArea {
+                    anchors.fill: parent
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: {
+                      root.formType = "jmap"
+                      root.formColor = "#ff7700"
+                    }
                   }
                 }
               }
@@ -1813,11 +1862,35 @@ Panel {
               TextField {
                 id: calNameInput
                 width: parent.width
-                placeholderText: "Calendar Name (e.g. Personal, Proton, Work)"
+                placeholderText: "Calendar Name (e.g. Personal, Proton, Fastmail)"
                 text: root.formName
                 foreground: root.contentForeground
                 font.family: root.contentFontFamily
                 onTextChanged: root.formName = text
+              }
+
+              // JMAP Session URL Field (JMAP only)
+              TextField {
+                id: calJmapUrlInput
+                visible: root.formType === "jmap"
+                width: parent.width
+                placeholderText: "Session URL (default: https://api.fastmail.com/jmap/session)"
+                text: root.formJmapUrl
+                foreground: root.contentForeground
+                font.family: root.contentFontFamily
+                onTextChanged: root.formJmapUrl = text
+              }
+
+              // JMAP Token Field (JMAP only)
+              TextField {
+                id: calJmapTokenInput
+                visible: root.formType === "jmap"
+                width: parent.width
+                placeholderText: "JMAP API / Bearer Token"
+                text: root.formJmapToken
+                foreground: root.contentForeground
+                font.family: root.contentFontFamily
+                onTextChanged: root.formJmapToken = text
               }
 
               // Address / ID Field
@@ -1826,7 +1899,9 @@ Panel {
                 width: parent.width
                 placeholderText: root.formType === "googleId"
                   ? "Google Calendar ID (e.g. xyz@group.calendar.google.com)"
-                  : "iCal URL (Google, Apple, Proton .ics link)"
+                  : (root.formType === "jmap"
+                     ? "Calendar ID (optional, leave blank for all)"
+                     : "iCal URL (Google, Apple, Proton .ics link)")
                 text: root.formAddress
                 foreground: root.contentForeground
                 font.family: root.contentFontFamily
@@ -2039,7 +2114,7 @@ Panel {
 
                       Text {
                         textFormat: Text.PlainText
-                        text: modelData.googleCalendarId ? "GOOGLE API" : "ICAL FEED"
+                        text: (modelData.type === "jmap" || modelData.jmapToken) ? "JMAP" : (modelData.googleCalendarId ? "GOOGLE API" : "ICAL FEED")
                         color: Qt.darker(root.contentForeground, 1.9)
                         font.family: root.contentFontFamily
                         font.pixelSize: Style.font.caption
@@ -2048,7 +2123,7 @@ Panel {
 
                     Text {
                       textFormat: Text.PlainText
-                      text: modelData.googleCalendarId || modelData.url || "No address"
+                      text: (modelData.type === "jmap" || modelData.jmapToken) ? (modelData.jmapUrl || "JMAP Feed") : (modelData.googleCalendarId || modelData.url || "No address")
                       color: Qt.darker(root.contentForeground, 1.9)
                       font.family: root.contentFontFamily
                       font.pixelSize: Style.font.caption

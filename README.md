@@ -1,6 +1,6 @@
 # Calendar Sync for Omarchy
 
-A fast, lightweight calendar and clock status bar plugin for Omarchy that syncs Google Calendar, Apple iCloud, Proton Calendar, Microsoft Outlook, Nextcloud, and generic iCalendar (.ics / webcal) feeds directly into your desktop.
+A fast, lightweight calendar and clock status bar plugin for Omarchy that syncs Google Calendar, Apple iCloud, Proton Calendar, Microsoft Outlook, Fastmail (JMAP / iCal), Nextcloud, Stalwart, and generic iCalendar (.ics / webcal) feeds directly into your desktop.
 
 ![GitHub stars](https://img.shields.io/github/stars/promaaa/sync-calendar-omarchy?style=flat-square)
 ![License](https://img.shields.io/github/license/promaaa/sync-calendar-omarchy?style=flat-square)
@@ -16,7 +16,7 @@ A fast, lightweight calendar and clock status bar plugin for Omarchy that syncs 
 
 ## Features
 
-- **Universal iCalendar Support**: Compatible with any calendar service providing an `.ics` / `webcal://` link (Google, Apple iCloud, Proton, Outlook / Office 365, Nextcloud, Fastmail, or local `.ics` files).
+- **Universal iCalendar & JMAP Support**: Compatible with any calendar service providing an `.ics` / `webcal://` link (Google, Apple iCloud, Proton, Outlook / Office 365, Nextcloud, generic iCal) or modern **JMAP** API (Fastmail, Stalwart, Cyrus IMAP, Apache James).
 - **One-Click "Join Meeting"**: Automatically detects Google Meet, Zoom, Microsoft Teams, Webex, and Jitsi links in event details and displays an instant join button.
 - **Staged & Configurable Notifications**: Native alerts prior to upcoming meetings with smart staged reminders (10m, 5m, 1m before) or single intervals (5m, 10m, 15m, 30m).
 - **Copy Agenda as Markdown**: 1-click clipboard export (`󰆏` button or `y` hotkey) to format your daily schedule into clean Markdown tasks for standups, Slack, or Obsidian.
@@ -59,6 +59,14 @@ Configure your calendar feeds and preferences using the in-app **Settings Menu (
 
 ```json
 [
+  {
+    "name": "Fastmail JMAP",
+    "type": "jmap",
+    "jmapUrl": "https://api.fastmail.com/jmap/session",
+    "jmapToken": "fmu1-xxxxxxxxxxxxxxxx",
+    "color": "#ff7700",
+    "enabled": true
+  },
   {
     "name": "Google Calendar",
     "url": "https://calendar.google.com/calendar/ical/your_email%40gmail.com/private-xxxxxxxxxxxxxxxx/basic.ics",
@@ -116,7 +124,23 @@ Edits to `calendars.json` hot-reload automatically without restarting the shell.
 2. Go to **Settings (`󰒓`)** $\rightarrow$ **Calendar** $\rightarrow$ **Shared calendars**.
 3. Under **Publish a calendar**, select your calendar and permissions $\rightarrow$ Click **Publish** $\rightarrow$ Copy the **ICS** link.
 
-### Nextcloud / ownCloud / Fastmail / Generic iCal
+### JMAP Calendar (Fastmail, Stalwart, Cyrus, Apache James)
+
+JMAP is a modern, fast, JSON-based calendar standard ([RFC 9670](https://www.rfc-editor.org/rfc/rfc9670) / [RFC 8984](https://www.rfc-editor.org/rfc/rfc8984)). It syncs directly via API tokens with zero OAuth setup required.
+
+#### 1. Fastmail
+1. Go to Fastmail **Settings (`󰒓`)** $\rightarrow$ **Privacy & Security** $\rightarrow$ **Integrations** $\rightarrow$ **Manage API tokens**.
+2. Click **New API Token** $\rightarrow$ select **Calendars** (or Full access) $\rightarrow$ Generate and copy the token.
+3. Add in the plugin settings (**Settings (`󰒓`) $\rightarrow$ + Add Calendar $\rightarrow$ JMAP**):
+   - **Session URL**: `https://api.fastmail.com/jmap/session` *(default)*
+   - **API Token**: `fmu1-xxxxxxxxxxxxxxxx`
+
+#### 2. Stalwart / Cyrus / Generic JMAP Servers
+- **Session URL**: `https://mail.example.com/.well-known/jmap` (or `https://mail.example.com/jmap/session`)
+- **API Token**: Your user / application Bearer token
+- **Calendar ID**: *(Optional)* Specific calendar ID or leave blank to query all calendars in your account.
+
+### Nextcloud / ownCloud / Generic iCal
 1. In your calendar web interface, open calendar settings / sharing options.
 2. Look for **Public link**, **Subscription link**, or **Export / iCal link** (`.ics` or `webcal://`).
 3. Paste the URL into the plugin settings.
