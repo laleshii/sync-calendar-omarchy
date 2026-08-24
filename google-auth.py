@@ -9,6 +9,7 @@ import sys
 import json
 import time
 import secrets
+import stat
 import webbrowser
 import urllib.request
 import urllib.parse
@@ -68,29 +69,101 @@ def safe_read_text(stream, max_bytes=MAX_CONFIG_BYTES):
 
 def safe_load_json(file_path, max_bytes=MAX_CONFIG_BYTES):
     """
-    Safely reads and parses JSON from a file ensuring size is strictly bounded.
+    Read JSON from one descriptor, rejecting links, non-files, foreign owners,
+    and files larger than the configured limit.
     """
-    if not os.path.exists(file_path):
-        return None
-    with open(file_path, "r", encoding="utf-8") as f:
-        text = safe_read_text(f, max_bytes=max_bytes)
-        return json.loads(text)
-
-
-def write_secure_json(path, data, mode=0o600):
-    """Write sensitive JSON data atomically with owner-only permissions (0600)."""
-    dir_name = os.path.dirname(path)
-    if dir_name:
-        os.makedirs(dir_name, mode=0o700, exist_ok=True)
-    tmp_path = path + f".tmp.{os.getpid()}"
-    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp_path, path)
+    dir_name = os.path.dirname(os.path.abspath(file_path))
+    file_name = os.path.basename(file_path)
+    dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
-        os.chmod(path, mode)
-    except OSError:
-        pass
+        dir_fd = os.open(dir_name, dir_flags)
+    except FileNotFoundError:
+        return None
+    try:
+        dir_stat = os.fstat(dir_fd)
+        if not stat.S_ISDIR(dir_stat.st_mode) or dir_stat.st_uid != os.getuid():
+            raise PermissionError(f"Unsafe JSON directory: {dir_name}")
+        try:
+            fd = os.open(file_name, file_flags, dir_fd=dir_fd)
+        except FileNotFoundError:
+            return None
+        try:
+            file_stat = os.fstat(fd)
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise ValueError(f"JSON path is not a regular file: {file_path}")
+            if file_stat.st_uid != os.getuid():
+                raise PermissionError(f"JSON file is not owned by the current user: {file_path}")
+            if file_stat.st_size > max_bytes:
+                raise ValueError(f"JSON file exceeds safety limit of {max_bytes} bytes")
+            with os.fdopen(fd, "rb", closefd=False) as f:
+                raw = safe_read_bytes(f, max_bytes=max_bytes)
+            return json.loads(raw.decode("utf-8"))
+        finally:
+            os.close(fd)
+    finally:
+        os.close(dir_fd)
+
+
+def write_secure_json(path, data, mode=0o600, max_bytes=MAX_CONFIG_BYTES):
+    """Atomically replace an owned regular JSON file through its directory fd."""
+    payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+    if len(payload) > max_bytes:
+        raise ValueError(f"JSON output exceeds safety limit of {max_bytes} bytes")
+    abs_path = os.path.abspath(path)
+    dir_name = os.path.dirname(abs_path)
+    file_name = os.path.basename(abs_path)
+    os.makedirs(dir_name, mode=0o700, exist_ok=True)
+    dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    dir_fd = os.open(dir_name, dir_flags)
+    tmp_name = None
+    try:
+        dir_stat = os.fstat(dir_fd)
+        if not stat.S_ISDIR(dir_stat.st_mode) or dir_stat.st_uid != os.getuid():
+            raise PermissionError(f"Unsafe JSON directory: {dir_name}")
+        try:
+            existing = os.stat(file_name, dir_fd=dir_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None:
+            if not stat.S_ISREG(existing.st_mode):
+                raise ValueError(f"JSON path is not a regular file: {path}")
+            if existing.st_uid != os.getuid():
+                raise PermissionError(f"JSON file is not owned by the current user: {path}")
+
+        create_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        for _ in range(128):
+            candidate = f".{file_name}.tmp-{secrets.token_hex(16)}"
+            try:
+                fd = os.open(candidate, create_flags, mode, dir_fd=dir_fd)
+                tmp_name = candidate
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise FileExistsError("Unable to allocate an exclusive JSON temporary file")
+        try:
+            tmp_stat = os.fstat(fd)
+            if not stat.S_ISREG(tmp_stat.st_mode) or tmp_stat.st_uid != os.getuid():
+                raise PermissionError("Unsafe JSON temporary file")
+            os.fchmod(fd, mode)
+            view = memoryview(payload)
+            while view:
+                written = os.write(fd, view)
+                view = view[written:]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp_name, file_name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        tmp_name = None
+        os.fsync(dir_fd)
+    finally:
+        if tmp_name is not None:
+            try:
+                os.unlink(tmp_name, dir_fd=dir_fd)
+            except FileNotFoundError:
+                pass
+        os.close(dir_fd)
 
 
 class OAuthCallbackHandler(BaseHTTPRequestHandler):

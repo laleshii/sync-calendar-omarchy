@@ -9,6 +9,8 @@ import os
 import sys
 import json
 import re
+import secrets
+import stat
 import time
 import calendar
 import urllib.request
@@ -32,6 +34,7 @@ _translation_cache = {}
 MAX_ICAL_BYTES = 10 * 1024 * 1024   # 10 MB limit for calendar .ics content
 MAX_API_BYTES = 5 * 1024 * 1024     # 5 MB limit for API JSON responses
 MAX_CONFIG_BYTES = 1 * 1024 * 1024  # 1 MB limit for local config files
+MAX_OUTPUT_JSON_BYTES = 25 * 1024 * 1024  # 25 MB limit for generated event state
 
 
 def safe_read_bytes(stream, max_bytes=MAX_ICAL_BYTES):
@@ -74,29 +77,102 @@ def safe_read_text(stream, max_bytes=MAX_ICAL_BYTES):
 
 def safe_load_json(file_path, max_bytes=MAX_CONFIG_BYTES):
     """
-    Safely reads and parses JSON from a file ensuring size is strictly bounded.
+    Read JSON from one descriptor, rejecting links, non-files, foreign owners,
+    and files larger than the configured limit.
     """
-    if not os.path.exists(file_path):
-        return None
-    with open(file_path, "r", encoding="utf-8") as f:
-        text = safe_read_text(f, max_bytes=max_bytes)
-        return json.loads(text)
+    dir_name = os.path.dirname(os.path.abspath(file_path))
+    file_name = os.path.basename(file_path)
+    dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
 
-
-def write_secure_json(path, data, mode=0o600):
-    """Write sensitive JSON data atomically with owner-only permissions (0600)."""
-    dir_name = os.path.dirname(path)
-    if dir_name:
-        os.makedirs(dir_name, mode=0o700, exist_ok=True)
-    tmp_path = path + f".tmp.{os.getpid()}"
-    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp_path, path)
     try:
-        os.chmod(path, mode)
-    except OSError:
-        pass
+        dir_fd = os.open(dir_name, dir_flags)
+    except FileNotFoundError:
+        return None
+    try:
+        dir_stat = os.fstat(dir_fd)
+        if not stat.S_ISDIR(dir_stat.st_mode) or dir_stat.st_uid != os.getuid():
+            raise PermissionError(f"Unsafe JSON directory: {dir_name}")
+        try:
+            fd = os.open(file_name, file_flags, dir_fd=dir_fd)
+        except FileNotFoundError:
+            return None
+        try:
+            file_stat = os.fstat(fd)
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise ValueError(f"JSON path is not a regular file: {file_path}")
+            if file_stat.st_uid != os.getuid():
+                raise PermissionError(f"JSON file is not owned by the current user: {file_path}")
+            if file_stat.st_size > max_bytes:
+                raise ValueError(f"JSON file exceeds safety limit of {max_bytes} bytes")
+            with os.fdopen(fd, "rb", closefd=False) as f:
+                raw = safe_read_bytes(f, max_bytes=max_bytes)
+            return json.loads(raw.decode("utf-8"))
+        finally:
+            os.close(fd)
+    finally:
+        os.close(dir_fd)
+
+
+def write_secure_json(path, data, mode=0o600, max_bytes=MAX_CONFIG_BYTES):
+    """Atomically replace an owned regular JSON file through its directory fd."""
+    payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+    if len(payload) > max_bytes:
+        raise ValueError(f"JSON output exceeds safety limit of {max_bytes} bytes")
+    abs_path = os.path.abspath(path)
+    dir_name = os.path.dirname(abs_path)
+    file_name = os.path.basename(abs_path)
+    os.makedirs(dir_name, mode=0o700, exist_ok=True)
+    dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    dir_fd = os.open(dir_name, dir_flags)
+    tmp_name = None
+    try:
+        dir_stat = os.fstat(dir_fd)
+        if not stat.S_ISDIR(dir_stat.st_mode) or dir_stat.st_uid != os.getuid():
+            raise PermissionError(f"Unsafe JSON directory: {dir_name}")
+        try:
+            existing = os.stat(file_name, dir_fd=dir_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None:
+            if not stat.S_ISREG(existing.st_mode):
+                raise ValueError(f"JSON path is not a regular file: {path}")
+            if existing.st_uid != os.getuid():
+                raise PermissionError(f"JSON file is not owned by the current user: {path}")
+
+        create_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        for _ in range(128):
+            candidate = f".{file_name}.tmp-{secrets.token_hex(16)}"
+            try:
+                fd = os.open(candidate, create_flags, mode, dir_fd=dir_fd)
+                tmp_name = candidate
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise FileExistsError("Unable to allocate an exclusive JSON temporary file")
+        try:
+            tmp_stat = os.fstat(fd)
+            if not stat.S_ISREG(tmp_stat.st_mode) or tmp_stat.st_uid != os.getuid():
+                raise PermissionError("Unsafe JSON temporary file")
+            os.fchmod(fd, mode)
+            view = memoryview(payload)
+            while view:
+                written = os.write(fd, view)
+                view = view[written:]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp_name, file_name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        tmp_name = None
+        os.fsync(dir_fd)
+    finally:
+        if tmp_name is not None:
+            try:
+                os.unlink(tmp_name, dir_fd=dir_fd)
+            except FileNotFoundError:
+                pass
+        os.close(dir_fd)
 
 
 def load_translation_cache():
@@ -149,7 +225,11 @@ def translate_korean_to_english(text):
 
 def ensure_config_exists():
     """Create a default sample config if it does not exist."""
-    if not os.path.exists(CONFIG_PATH):
+    try:
+        existing = safe_load_json(CONFIG_PATH, max_bytes=MAX_CONFIG_BYTES)
+    except (json.JSONDecodeError, OSError, ValueError):
+        return
+    if existing is None:
         sample = [
             {
                 "name": "Personal Calendar",
@@ -719,8 +799,6 @@ AUTH_FILE = os.path.join(STATE_DIR, "google-auth.json")
 
 def get_google_access_token():
     """Retrieve or refresh Google OAuth2 access token."""
-    if not os.path.exists(AUTH_FILE):
-        return None
     try:
         auth_data = safe_load_json(AUTH_FILE, max_bytes=MAX_CONFIG_BYTES)
         if not auth_data:
@@ -992,6 +1070,54 @@ def parse_jmap_datetime(dt_str):
         return datetime.now()
 
 
+def validate_jmap_https_url(url, trusted_origin=None):
+    """Return a validated credential-free HTTPS URL and its canonical origin."""
+    if not isinstance(url, str) or not url or any(ord(char) < 0x20 for char in url) or "\\" in url:
+        raise ValueError("JMAP URL is invalid")
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("JMAP URL is invalid") from exc
+    if parsed.scheme.lower() != "https" or not parsed.hostname:
+        raise ValueError("JMAP URL must use HTTPS")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("JMAP URL must not contain credentials")
+    if parsed.fragment:
+        raise ValueError("JMAP URL must not contain a fragment")
+    try:
+        hostname = parsed.hostname.rstrip(".").encode("idna").decode("ascii").lower()
+    except UnicodeError as exc:
+        raise ValueError("JMAP URL hostname is invalid") from exc
+    origin = ("https", hostname, port or 443)
+    if trusted_origin is not None and origin != trusted_origin:
+        raise ValueError("JMAP URL must remain on the configured session origin")
+    return url, origin
+
+
+class JmapSameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Allow bearer-authenticated redirects only within the trusted HTTPS origin."""
+
+    def __init__(self, trusted_origin):
+        super().__init__()
+        self.trusted_origin = trusted_origin
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        validate_jmap_https_url(newurl, self.trusted_origin)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def open_trusted_jmap(opener, request, trusted_origin, timeout):
+    """Open a JMAP request and verify the transport's final URL before use."""
+    response = opener.open(request, timeout=timeout)
+    try:
+        validate_jmap_https_url(response.geturl(), trusted_origin)
+    except Exception:
+        response.close()
+        raise
+    return response
+
+
 def fetch_jmap_calendar(cal_info, window_start, window_end):
     """
     Fetches calendar events from a JMAP server (RFC 8620, RFC 9670, RFC 8984 JSCalendar).
@@ -1004,13 +1130,13 @@ def fetch_jmap_calendar(cal_info, window_start, window_end):
 
     if not session_url:
         session_url = "https://api.fastmail.com/jmap/session"
-    elif not session_url.startswith("http://") and not session_url.startswith("https://"):
+    elif "://" not in session_url:
         session_url = "https://" + session_url
 
     # Auto-resolve hostnames to .well-known/jmap if no path specified
-    parsed = urllib.parse.urlparse(session_url)
+    parsed = urllib.parse.urlsplit(session_url)
     if not parsed.path or parsed.path == "/":
-        session_url = urllib.parse.urlunparse(parsed._replace(path="/.well-known/jmap"))
+        session_url = urllib.parse.urlunsplit(parsed._replace(path="/.well-known/jmap"))
 
     if not token:
         return {
@@ -1021,17 +1147,19 @@ def fetch_jmap_calendar(cal_info, window_start, window_end):
             "count": 0,
         }
 
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "User-Agent": USER_AGENT,
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    }
-
     try:
+        session_url, trusted_origin = validate_jmap_https_url(session_url)
+        opener = urllib.request.build_opener(JmapSameOriginRedirectHandler(trusted_origin))
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+
         # Step 1: Session Discovery
         req = urllib.request.Request(session_url, headers=headers, method="GET")
-        with urllib.request.urlopen(req, timeout=12) as resp:
+        with open_trusted_jmap(opener, req, trusted_origin, timeout=12) as resp:
             raw_session = safe_read_bytes(resp, max_bytes=MAX_API_BYTES)
             session_data = json.loads(raw_session.decode("utf-8"))
 
@@ -1044,6 +1172,7 @@ def fetch_jmap_calendar(cal_info, window_start, window_end):
                 "status": "error: no apiUrl in JMAP session response",
                 "count": 0,
             }
+        api_url, _ = validate_jmap_https_url(api_url, trusted_origin)
 
         # Find account supporting calendars
         accounts = session_data.get("accounts", {})
@@ -1120,7 +1249,7 @@ def fetch_jmap_calendar(cal_info, window_start, window_end):
         payload_bytes = json.dumps(payload).encode("utf-8")
         post_req = urllib.request.Request(api_url, data=payload_bytes, headers=headers, method="POST")
 
-        with urllib.request.urlopen(post_req, timeout=15) as resp:
+        with open_trusted_jmap(opener, post_req, trusted_origin, timeout=15) as resp:
             raw_data = safe_read_bytes(resp, max_bytes=MAX_API_BYTES)
             response_data = json.loads(raw_data.decode("utf-8"))
 
@@ -1274,9 +1403,8 @@ def main():
                 sys.exit(1)
         elif arg == "--get-config":
             ensure_config_exists()
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                content = safe_read_text(f, max_bytes=MAX_CONFIG_BYTES)
-                print(content)
+            content = safe_load_json(CONFIG_PATH, max_bytes=MAX_CONFIG_BYTES)
+            print(json.dumps(content, ensure_ascii=False, indent=2))
             sys.exit(0)
         elif arg == "--auth-status":
             auth_ok = False
@@ -1357,13 +1485,12 @@ def main():
         )
 
     auth_ok = False
-    if os.path.exists(AUTH_FILE):
-        try:
-            with open(AUTH_FILE, "r", encoding="utf-8") as f:
-                auth_d = json.load(f)
-                auth_ok = bool(auth_d.get("refresh_token") and auth_d.get("client_id"))
-        except Exception:
-            pass
+    try:
+        auth_d = safe_load_json(AUTH_FILE, max_bytes=MAX_CONFIG_BYTES)
+        if auth_d:
+            auth_ok = bool(auth_d.get("refresh_token") and auth_d.get("client_id"))
+    except Exception:
+        pass
 
     output_data = {
         "lastSynced": int(time.time()),
@@ -1375,7 +1502,7 @@ def main():
         "eventsByDate": events_by_date,
     }
 
-    write_secure_json(OUTPUT_PATH, output_data, mode=0o600)
+    write_secure_json(OUTPUT_PATH, output_data, mode=0o600, max_bytes=MAX_OUTPUT_JSON_BYTES)
     save_translation_cache()
 
     print(json.dumps({
