@@ -118,6 +118,7 @@ Panel {
   }
 
   function startAddingCalendar(type) {
+    root.settingsTab = "calendars"
     formName = ""
     formType = type || "url"
     formAddress = ""
@@ -125,6 +126,7 @@ Panel {
     formJmapToken = ""
     formColor = formType === "googleId" ? "#e01b24" : (formType === "jmap" ? "#ff7700" : "#4285f4")
     addingCalendar = true
+    if (calendarScroll) calendarScroll.contentY = 0
   }
 
   function commitNewCalendar() {
