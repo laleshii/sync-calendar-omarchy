@@ -68,6 +68,7 @@ Panel {
   property string formJmapUrl: ""
   property string formJmapToken: ""
   property string formColor: "#4285f4"
+  property string pendingConfigJson: ""
 
   function openSettings(tab) {
     showingSettings = true
@@ -84,11 +85,11 @@ Panel {
   }
 
   function saveCalendars(list) {
+    pendingConfigJson = JSON.stringify(list, null, 2)
     saveConfigProc.command = [
       "python3",
       Qt.resolvedUrl("fetch-events.py").toString().replace(/^file:\/\//, ""),
-      "--save-config",
-      JSON.stringify(list)
+      "--save-config"
     ]
     saveConfigProc.running = true
   }
@@ -324,9 +325,11 @@ Panel {
   }
 
   function openExternalUrl(url) {
-    if (!url) return
-    var targetUrl = String(url).trim()
+    if (!url || typeof url !== "string") return
+    var targetUrl = url.trim()
     if (!targetUrl) return
+    // Validate scheme and characters before passing to Qt.openUrlExternally / xdg-open
+    if (!/^https?:\/\/[a-zA-Z0-9.\-]+(?::\d+)?(\/[^\s<>"'`]*)?$/i.test(targetUrl)) return
     if (typeof Qt.openUrlExternally === "function") {
       Qt.openUrlExternally(targetUrl)
     } else {
@@ -490,9 +493,14 @@ Panel {
 
   Process {
     id: saveConfigProc
+    stdinEnabled: true
+    onStarted: {
+      write(root.pendingConfigJson + "\n")
+    }
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
+        root.pendingConfigJson = ""
         configFile.reload()
         root.syncCalendars(true)
       }

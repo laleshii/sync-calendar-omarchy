@@ -162,5 +162,227 @@ class JmapTransportTests(unittest.TestCase):
         self.assertTrue(response.closed)
 
 
+class MeetingUrlSecurityTests(unittest.TestCase):
+    def test_validate_meeting_url_accepts_clean_http_and_https_urls(self):
+        valid_urls = [
+            "https://meet.google.com/abc-defg-hij",
+            "https://us02web.zoom.us/j/1234567890",
+            "https://teams.microsoft.com/l/meetup-join/19%3ameeting",
+            "https://custom.server.com/rooms/101",
+            "http://local.meeting.net/join/test",
+        ]
+        for url in valid_urls:
+            with self.subTest(url=url):
+                self.assertEqual(fetch_events.validate_meeting_url(url), url)
+
+    def test_validate_meeting_url_rejects_dangerous_and_malformed_schemes(self):
+        invalid_urls = [
+            "javascript:alert(1)",
+            "file:///bin/sh",
+            "data:text/html,<script>alert(1)</script>",
+            "<h1>Meeting Title</h1>",
+            "<script src='http://evil.com'></script>",
+            "https://meet.google.com/<script>",
+            "https://user:pass@meet.google.com/room",
+            "https://zoom.us/j/123\nnewline",
+            "ftp://files.example.com/meet",
+            "",
+            None,
+            12345,
+            "https://",
+            "https://[invalid-host",
+        ]
+        for url in invalid_urls:
+            with self.subTest(url=url):
+                self.assertEqual(fetch_events.validate_meeting_url(url), "")
+
+    def test_jmap_virtual_locations_unsafe_uri_is_sanitized(self):
+        raw_events = [
+            {
+                "id": "jmap_unsafe_1",
+                "title": "Malicious Meeting",
+                "start": "2026-08-25T10:00:00Z",
+                "virtualLocations": {
+                    "loc1": {"uri": "file:///bin/sh"},
+                    "loc2": {"uri": "<img src=x onerror=alert(1)>"},
+                    "loc3": {"uri": "javascript:window.open()"},
+                },
+            },
+            {
+                "id": "jmap_safe_1",
+                "title": "Safe Meeting",
+                "start": "2026-08-25T11:00:00Z",
+                "virtualLocations": {
+                    "loc1": {"uri": "https://meet.jit.si/SafeRoom"},
+                },
+            },
+        ]
+        cal_info = {"name": "Test JMAP", "type": "jmap", "jmapToken": "secret"}
+        start = fetch_events.datetime(2026, 8, 25, 0, 0, 0)
+        end = fetch_events.datetime(2026, 8, 25, 23, 59, 59)
+
+        # Mock JMAP network responses to return raw_events
+        session_json = json.dumps({
+            "apiUrl": "https://calendar.example/api",
+            "accounts": {"acc1": {"accountCapabilities": {"urn:ietf:params:jmap:calendars": {}}}},
+            "primaryAccounts": {"urn:ietf:params:jmap:calendars": "acc1"},
+        }).encode("utf-8")
+
+        query_get_json = json.dumps({
+            "methodResponses": [
+                ["CalendarEvent/get", {"list": raw_events}, "get0"]
+            ]
+        }).encode("utf-8")
+
+        fake_session = JmapTransportTests.FakeResponse("https://calendar.example/session", session_json)
+        fake_api = JmapTransportTests.FakeResponse("https://calendar.example/api", query_get_json)
+
+        opener = mock.Mock()
+        opener.open.side_effect = [fake_session, fake_api]
+
+        with mock.patch.object(fetch_events.urllib.request, "build_opener", return_value=opener):
+            cal_info["jmapUrl"] = "https://calendar.example/session"
+            result = fetch_events.fetch_jmap_calendar(cal_info, start, end)
+
+        self.assertEqual(result["status"], "ok")
+        events = result["events"]
+        self.assertEqual(len(events), 2)
+        # Event 1 with dangerous URIs should have empty meetingUrl and meetingProvider
+        self.assertEqual(events[0]["meetingUrl"], "")
+        self.assertEqual(events[0]["meetingProvider"], "")
+        # Event 2 with safe Jitsi URI should be extracted
+        self.assertEqual(events[1]["meetingUrl"], "https://meet.jit.si/SafeRoom")
+        self.assertEqual(events[1]["meetingProvider"], "Jitsi")
+
+
+class RecurrenceCpuCeilingTests(unittest.TestCase):
+    def test_multiday_expansion_on_multi_century_event_is_clamped_and_bounded(self):
+        window_start = fetch_events.datetime(2026, 8, 1)
+        window_end = fetch_events.datetime(2026, 8, 31)
+        # Event spanning 1000 years
+        event = {
+            "id": "centuries_evt",
+            "title": "Century Span",
+            "start_dt": fetch_events.datetime(1900, 1, 1),
+            "end_dt": fetch_events.datetime(2900, 1, 1),
+            "all_day": True,
+            "calendar": "Test",
+            "color": "#4A90E2",
+            "location": "",
+            "description": "",
+        }
+        instances = fetch_events.expand_multiday_event(event, window_start, window_end)
+        # Should be bounded to days within the window (31 days) and not loop millions of times
+        self.assertLessEqual(len(instances), 31)
+        self.assertGreater(len(instances), 0)
+        for inst in instances:
+            dt = fetch_events.datetime.strptime(inst["date_key"], "%Y-%m-%d")
+            self.assertTrue(window_start <= dt <= window_end)
+
+    def test_multiday_expansion_outside_window_returns_empty_immediately(self):
+        window_start = fetch_events.datetime(2026, 8, 1)
+        window_end = fetch_events.datetime(2026, 8, 31)
+        event = {
+            "id": "past_evt",
+            "title": "Past",
+            "start_dt": fetch_events.datetime(2020, 1, 1),
+            "end_dt": fetch_events.datetime(2020, 1, 10),
+            "all_day": True,
+            "calendar": "Test",
+            "color": "#4A90E2",
+            "location": "",
+            "description": "",
+        }
+        instances = fetch_events.expand_multiday_event(event, window_start, window_end)
+        self.assertEqual(instances, [])
+
+    def test_daily_recurrence_from_distant_past_terminates_under_cpu_ceiling(self):
+        window_start = fetch_events.datetime(2026, 8, 1)
+        window_end = fetch_events.datetime(2026, 8, 31)
+        event = {
+            "id": "old_rec",
+            "title": "Ancient Daily Recurrence",
+            "start_dt": fetch_events.datetime(1000, 1, 1, 9, 0, 0),
+            "end_dt": fetch_events.datetime(1000, 1, 1, 10, 0, 0),
+            "all_day": False,
+            "calendar": "Test",
+            "color": "#4A90E2",
+            "location": "",
+            "description": "",
+            "rrule": {"FREQ": "DAILY", "INTERVAL": "1"},
+        }
+        # Should fast-forward and expand within window without timeout
+        instances = fetch_events.expand_recurring_event(event, window_start, window_end)
+        self.assertGreater(len(instances), 0)
+        self.assertLessEqual(len(instances), 31)
+        for inst in instances:
+            self.assertTrue(window_start <= inst["start_dt"] <= window_end)
+
+    def test_weekly_recurrence_from_distant_past_terminates_under_cpu_ceiling(self):
+        window_start = fetch_events.datetime(2026, 8, 1)
+        window_end = fetch_events.datetime(2026, 8, 31)
+        event = {
+            "id": "old_weekly",
+            "title": "Ancient Weekly Recurrence",
+            "start_dt": fetch_events.datetime(1500, 1, 1, 9, 0, 0),
+            "end_dt": fetch_events.datetime(1500, 1, 1, 10, 0, 0),
+            "all_day": False,
+            "calendar": "Test",
+            "color": "#4A90E2",
+            "location": "",
+            "description": "",
+            "rrule": {"FREQ": "WEEKLY", "INTERVAL": "1"},
+        }
+        instances = fetch_events.expand_recurring_event(event, window_start, window_end)
+        self.assertGreater(len(instances), 0)
+        for inst in instances:
+            self.assertTrue(window_start <= inst["start_dt"] <= window_end)
+
+
+class ConfigAndStateSecurityTests(unittest.TestCase):
+    def test_save_config_from_stdin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = os.path.join(directory, "calendars.json")
+            with mock.patch.object(fetch_events, "CONFIG_PATH", config_path):
+                stdin_payload = json.dumps([{"name": "Fastmail", "type": "jmap", "jmapToken": "secret-token"}])
+                with mock.patch("sys.argv", ["fetch-events.py", "--save-config"]), \
+                     mock.patch("sys.stdin.readline", return_value=stdin_payload + "\n"), \
+                     self.assertRaises(SystemExit) as cm:
+                    fetch_events.main()
+                self.assertEqual(cm.exception.code, 0)
+                saved = fetch_events.safe_load_json(config_path)
+                self.assertEqual(saved, [{"name": "Fastmail", "type": "jmap", "jmapToken": "secret-token"}])
+                file_stat = os.stat(config_path)
+                self.assertEqual(stat.S_IMODE(file_stat.st_mode), 0o600)
+
+    def test_purge_plugin_data_removes_config_and_oauth_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_file = os.path.join(directory, "calendars.json")
+            auth_file = os.path.join(directory, "google-auth.json")
+            events_file = os.path.join(directory, "calendar-events.json")
+            cache_file = os.path.join(directory, "translation-cache.json")
+
+            with open(config_file, "w") as f:
+                f.write('{"jmapToken": "secret"}')
+            with open(auth_file, "w") as f:
+                f.write('{"refresh_token": "secret"}')
+            with open(events_file, "w") as f:
+                f.write('{"events": []}')
+            with open(cache_file, "w") as f:
+                f.write('{}')
+
+            with mock.patch.object(fetch_events, "CONFIG_PATH", config_file), \
+                 mock.patch.object(fetch_events, "AUTH_FILE", auth_file), \
+                 mock.patch.object(fetch_events, "OUTPUT_PATH", events_file), \
+                 mock.patch.object(fetch_events, "TRANSLATION_CACHE_PATH", cache_file), \
+                 mock.patch.object(fetch_events, "STATE_DIR", directory):
+                res = fetch_events.purge_plugin_data()
+                self.assertEqual(res["status"], "success")
+                self.assertFalse(os.path.exists(config_file))
+                self.assertFalse(os.path.exists(auth_file))
+                self.assertFalse(os.path.exists(events_file))
+                self.assertFalse(os.path.exists(cache_file))
+
+
 if __name__ == "__main__":
     unittest.main()

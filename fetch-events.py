@@ -35,6 +35,8 @@ MAX_ICAL_BYTES = 10 * 1024 * 1024   # 10 MB limit for calendar .ics content
 MAX_API_BYTES = 5 * 1024 * 1024     # 5 MB limit for API JSON responses
 MAX_CONFIG_BYTES = 1 * 1024 * 1024  # 1 MB limit for local config files
 MAX_OUTPUT_JSON_BYTES = 25 * 1024 * 1024  # 25 MB limit for generated event state
+MAX_RECURRENCE_ITERATIONS = 2000    # CPU-work ceiling for expanding recurrence rules
+MAX_EXPANDED_INSTANCES = 500        # Maximum instances generated per recurring/multiday event
 
 
 def safe_read_bytes(stream, max_bytes=MAX_ICAL_BYTES):
@@ -308,6 +310,38 @@ def parse_rrule(rrule_str):
     return rule
 
 
+def validate_meeting_url(url):
+    """
+    Validates and sanitizes meeting/conference URLs.
+    Accepts only valid http:// or https:// URLs with well-formed hostnames.
+    Rejects javascript:, file:, data:, HTML strings, control chars, quotes, and malformed URLs.
+    Returns sanitized URL string or '' if invalid/unsafe.
+    """
+    if not isinstance(url, str) or not url:
+        return ""
+    url = url.strip().rstrip(";,)>]\"'")
+    if not url:
+        return ""
+    # Reject strings with any control characters, whitespace, newlines, or HTML delimiters (<, >, ", ', `)
+    if any(ord(c) < 0x21 or ord(c) > 0x7E or c in '<>"\'`' for c in url):
+        return ""
+    if not re.match(r"^https?://[a-zA-Z0-9.\-]+(?::\d+)?(?:/[^\s<>'\"`]*)?$", url, re.IGNORECASE):
+        return ""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme.lower() not in ("http", "https"):
+            return ""
+        if not parsed.hostname:
+            return ""
+        if parsed.username or parsed.password:
+            return ""
+        # Validate hostname encoding
+        parsed.hostname.rstrip(".").encode("idna").decode("ascii")
+        return url
+    except Exception:
+        return ""
+
+
 def extract_meeting_info(location, description, summary):
     """
     Scans text fields for video conference / meeting URLs and identifies the provider.
@@ -330,13 +364,16 @@ def extract_meeting_info(location, description, summary):
     for pat, name in patterns:
         m = re.search(pat, combined, re.IGNORECASE)
         if m:
-            url = m.group(0).rstrip(";,)>]\"'")
-            return url, name
+            url = validate_meeting_url(m.group(0))
+            if url:
+                return url, name
 
     # Check if location contains any valid HTTP/HTTPS URL
     loc_url_m = re.search(r'https?://[^\s<>"\'\)\]]+', location or "")
     if loc_url_m:
-        return loc_url_m.group(0).rstrip(".,;)>]\"'"), "Meeting Link"
+        url = validate_meeting_url(loc_url_m.group(0))
+        if url:
+            return url, "Meeting Link"
 
     return None, None
 
@@ -427,8 +464,17 @@ def expand_weekly(event, window_start, window_end, rrule, until_dt, max_count):
 
     count = 0
     cur_week_start = week_start_date
+    has_count = bool(rrule.get("COUNT"))
 
-    while count < max_count:
+    # Fast forward if event started long before window and has no fixed COUNT
+    if not has_count and cur_week_start < (window_start - timedelta(weeks=interval)).date():
+        weeks_behind = (window_start.date() - cur_week_start).days // 7
+        if weeks_behind > 0:
+            cur_week_start += timedelta(weeks=(weeks_behind // interval) * interval)
+
+    iterations = 0
+    while count < max_count and iterations < MAX_RECURRENCE_ITERATIONS and len(instances) < MAX_EXPANDED_INSTANCES:
+        iterations += 1
         week_start_dt = datetime.combine(cur_week_start, datetime.min.time())
         if week_start_dt > window_end:
             break
@@ -454,7 +500,7 @@ def expand_weekly(event, window_start, window_end, rrule, until_dt, max_count):
                     inst["date_key"] = date_key
                     instances.append(inst)
 
-                if count >= max_count:
+                if count >= max_count or len(instances) >= MAX_EXPANDED_INSTANCES:
                     break
 
         cur_week_start += timedelta(weeks=interval)
@@ -481,8 +527,17 @@ def expand_daily(event, window_start, window_end, rrule, until_dt, max_count):
     instances = []
     cur_dt = start_dt
     count = 0
+    has_count = bool(rrule.get("COUNT"))
 
-    while count < max_count and cur_dt <= window_end:
+    # Fast forward if event started long before window and has no fixed COUNT
+    if not has_count and cur_dt < (window_start - timedelta(days=interval)):
+        days_behind = (window_start.date() - cur_dt.date()).days
+        if days_behind > 0:
+            cur_dt += timedelta(days=(days_behind // interval) * interval)
+
+    iterations = 0
+    while count < max_count and cur_dt <= window_end and iterations < MAX_RECURRENCE_ITERATIONS and len(instances) < MAX_EXPANDED_INSTANCES:
+        iterations += 1
         if until_dt and cur_dt > until_dt:
             break
 
@@ -516,8 +571,15 @@ def expand_monthly(event, window_start, window_end, rrule, until_dt, max_count):
     cur_year = start_dt.year
     cur_month = start_dt.month
     count = 0
+    has_count = bool(rrule.get("COUNT"))
 
-    while count < max_count:
+    if not has_count and cur_year < window_start.year - 1:
+        years_behind = window_start.year - 1 - cur_year
+        cur_year += years_behind
+
+    iterations = 0
+    while count < max_count and iterations < MAX_RECURRENCE_ITERATIONS and len(instances) < MAX_EXPANDED_INSTANCES:
+        iterations += 1
         month_start_dt = datetime(cur_year, cur_month, 1, 0, 0, 0)
         if until_dt and month_start_dt > until_dt:
             break
@@ -538,7 +600,7 @@ def expand_monthly(event, window_start, window_end, rrule, until_dt, max_count):
                 inst["end_dt"] = cur_dt + duration
                 inst["date_key"] = date_key
                 instances.append(inst)
-            if count >= max_count:
+            if count >= max_count or len(instances) >= MAX_EXPANDED_INSTANCES:
                 break
 
         total_months = (cur_year * 12 + cur_month - 1) + interval
@@ -569,8 +631,15 @@ def expand_yearly(event, window_start, window_end, rrule, until_dt, max_count):
     instances = []
     cur_year = start_dt.year
     count = 0
+    has_count = bool(rrule.get("COUNT"))
 
-    while count < max_count:
+    if not has_count and cur_year < window_start.year - 1:
+        years_behind = window_start.year - 1 - cur_year
+        cur_year += (years_behind // interval) * interval
+
+    iterations = 0
+    while count < max_count and iterations < MAX_RECURRENCE_ITERATIONS and len(instances) < MAX_EXPANDED_INSTANCES:
+        iterations += 1
         year_start_dt = datetime(cur_year, 1, 1, 0, 0, 0)
         if until_dt and year_start_dt > until_dt:
             break
@@ -592,7 +661,7 @@ def expand_yearly(event, window_start, window_end, rrule, until_dt, max_count):
                     inst["end_dt"] = cur_dt + duration
                     inst["date_key"] = date_key
                     instances.append(inst)
-                if count >= max_count:
+                if count >= max_count or len(instances) >= MAX_EXPANDED_INSTANCES:
                     break
 
         cur_year += interval
@@ -603,6 +672,7 @@ def expand_yearly(event, window_start, window_end, rrule, until_dt, max_count):
 def expand_recurring_event(event, window_start, window_end):
     """
     Expands a recurring VEVENT within [window_start, window_end].
+    Bounded by MAX_RECURRENCE_ITERATIONS and MAX_EXPANDED_INSTANCES.
     """
     rrule = event.get("rrule")
     if not rrule:
@@ -622,7 +692,7 @@ def expand_recurring_event(event, window_start, window_end):
         if until_dt < window_start:
             return []
 
-    max_count = int(count_str) if count_str and count_str.isdigit() else 1000
+    max_count = min(int(count_str) if count_str and count_str.isdigit() else 1000, 1000)
 
     start_dt = event["start_dt"]
     if freq == "WEEKLY":
@@ -643,6 +713,7 @@ def expand_recurring_event(event, window_start, window_end):
 def expand_multiday_event(event, window_start, window_end):
     """
     Expands a multi-day event across all affected calendar days within the window.
+    Strictly clamped to window bounds to enforce an immediate CPU work ceiling.
     """
     start_dt = event["start_dt"]
     end_dt = event["end_dt"]
@@ -661,15 +732,28 @@ def expand_multiday_event(event, window_start, window_end):
         event["date_key"] = start_date.strftime("%Y-%m-%d")
         return [event]
 
+    w_start_d = window_start.date()
+    w_end_d = window_end.date()
+
+    # Drop immediately if entirely outside the time window
+    if end_date < w_start_d or start_date > w_end_d:
+        return []
+
+    # Clamp iteration range to the time window to enforce an immediate CPU work ceiling
+    effective_start = max(start_date, w_start_d)
+    effective_end = min(end_date, w_end_d)
+
     instances = []
-    cur_date = start_date
-    while cur_date <= end_date:
-        cur_dt_midnight = datetime(cur_date.year, cur_date.month, cur_date.day)
-        if window_start <= cur_dt_midnight <= window_end:
-            inst = dict(event)
-            inst["date_key"] = cur_date.strftime("%Y-%m-%d")
-            instances.append(inst)
+    cur_date = effective_start
+    max_days = (w_end_d - w_start_d).days + 10
+    iterations = 0
+
+    while cur_date <= effective_end and iterations < max_days and len(instances) < MAX_EXPANDED_INSTANCES:
+        inst = dict(event)
+        inst["date_key"] = cur_date.strftime("%Y-%m-%d")
+        instances.append(inst)
         cur_date += timedelta(days=1)
+        iterations += 1
 
     return instances if instances else [event]
 
@@ -917,16 +1001,18 @@ def fetch_google_api_calendar(cal_info, window_start, window_end):
                 location = translate_korean_to_english(location)
 
             # Direct Google Meet link check
-            meeting_url = item.get("hangoutLink") or ""
+            meeting_url = validate_meeting_url(item.get("hangoutLink") or "")
             meeting_provider = "Google Meet" if meeting_url else ""
 
             if not meeting_url:
                 conf_data = item.get("conferenceData", {})
                 for ep in conf_data.get("entryPoints", []):
                     if ep.get("uri"):
-                        meeting_url = ep["uri"]
-                        meeting_provider = "Google Meet" if "meet.google" in meeting_url else "Meeting"
-                        break
+                        u = validate_meeting_url(ep.get("uri"))
+                        if u:
+                            meeting_url = u
+                            meeting_provider = "Google Meet" if "meet.google" in meeting_url else "Meeting"
+                            break
 
             if not meeting_url:
                 meeting_url, meeting_provider = extract_meeting_info(location, description, title)
@@ -1299,14 +1385,17 @@ def fetch_jmap_calendar(cal_info, window_start, window_end):
             if isinstance(vlocs, dict):
                 for vl in vlocs.values():
                     if isinstance(vl, dict) and vl.get("uri"):
-                        u = vl.get("uri")
-                        _, prov = extract_meeting_info(u, "", "")
+                        raw_u = str(vl.get("uri")).strip()
+                        safe_u = validate_meeting_url(raw_u)
+                        if not safe_u:
+                            continue
+                        _, prov = extract_meeting_info(safe_u, "", "")
                         if prov:
-                            meeting_url = u
+                            meeting_url = safe_u
                             meeting_provider = prov
                             break
                         elif not meeting_url:
-                            meeting_url = u
+                            meeting_url = safe_u
                             meeting_provider = "Online Meeting"
 
             if not meeting_url:
@@ -1386,18 +1475,74 @@ def fetch_calendar_item(cal_info, window_start, window_end):
         return fetch_calendar(cal_info, window_start, window_end)
 
 
+def purge_plugin_data():
+    """
+    Securely removes token-bearing configuration, OAuth credentials, and cached state:
+    - CONFIG_PATH (~/.config/omarchy/calendars.json)
+    - AUTH_FILE (~/.local/state/omarchy/google-auth.json)
+    - OUTPUT_PATH (~/.local/state/omarchy/calendar-events.json)
+    - TRANSLATION_CACHE_PATH (~/.local/state/omarchy/translation-cache.json)
+    """
+    removed = []
+    errors = []
+    targets = [
+        CONFIG_PATH,
+        AUTH_FILE,
+        OUTPUT_PATH,
+        TRANSLATION_CACHE_PATH,
+    ]
+    for target in targets:
+        try:
+            if os.path.exists(target) or os.path.islink(target):
+                os.unlink(target)
+                removed.append(target)
+        except Exception as exc:
+            errors.append(f"{target}: {exc}")
+
+    try:
+        if os.path.exists(STATE_DIR) and not os.listdir(STATE_DIR):
+            os.rmdir(STATE_DIR)
+            removed.append(STATE_DIR)
+    except Exception:
+        pass
+
+    return {
+        "status": "success" if not errors else "partial",
+        "removed": removed,
+        "errors": errors,
+    }
+
+
 def main():
+    if len(sys.argv) > 1:
+        arg = sys.argv[1]
+        if arg in ("--purge-data", "--purge-auth", "--cleanup", "--uninstall"):
+            res = purge_plugin_data()
+            print(json.dumps(res, indent=2))
+            sys.exit(0 if res["status"] == "success" else 1)
+
     ensure_config_exists()
     os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
     load_translation_cache()
 
     if len(sys.argv) > 1:
         arg = sys.argv[1]
-        if arg == "--save-config" and len(sys.argv) > 2:
+        if arg == "--save-config":
             try:
-                new_config = json.loads(sys.argv[2])
+                if len(sys.argv) > 2:
+                    raw_input = sys.argv[2]
+                else:
+                    raw_input = sys.stdin.readline()
+                    if not raw_input.strip():
+                        raw_input = sys.stdin.read(MAX_CONFIG_BYTES + 1)
+                if len(raw_input) > MAX_CONFIG_BYTES:
+                    raise ValueError(f"Config payload exceeds maximum size of {MAX_CONFIG_BYTES} bytes")
+                new_config = json.loads(raw_input)
+                if not isinstance(new_config, list):
+                    raise ValueError("Config must be a JSON array of calendar entries")
                 write_secure_json(CONFIG_PATH, new_config, mode=0o600)
                 print(json.dumps({"status": "success"}))
+                sys.exit(0)
             except Exception as e:
                 print(json.dumps({"status": "error", "message": str(e)}))
                 sys.exit(1)

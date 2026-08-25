@@ -165,8 +165,9 @@ JMAP is a modern, fast, JSON-based calendar standard ([RFC 9670](https://www.rfc
 
 #### 2. Run the Auth Helper
 ```bash
-python3 ~/.config/omarchy/plugins/promaa.clock/google-auth.py "<CLIENT_ID>" "<CLIENT_SECRET>"
+python3 ~/.config/omarchy/plugins/promaa.clock/google-auth.py
 ```
+- The helper will prompt interactively for your Client ID and Client Secret (or automatically detect the downloaded credentials file in `~/Downloads`).
 - A browser window will open asking you to sign in.
 - If Google shows *"Google hasn't verified this app"*, click **Advanced $\rightarrow$ Go to Omarchy Calendar (unsafe) $\rightarrow$ Continue / Allow**.
 
@@ -178,6 +179,43 @@ python3 ~/.config/omarchy/plugins/promaa.clock/google-auth.py "<CLIENT_ID>" "<CL
 * **`Error 400: redirect_uri_mismatch`**: Make sure the credential type is set to **Desktop app**, not Web application.
 * **`Access blocked: App has not completed verification`**: Add your Google account email to **Test users** in the OAuth consent screen.
 * **`HTTP Error 404: Not Found`**: Check that the `googleCalendarId` is the exact Calendar ID (not the display name). Test the sync with `python3 ~/.config/omarchy/plugins/promaa.clock/fetch-events.py`.
+
+
+## Uninstallation & Clean Removal
+
+### 1. Remove the Plugin
+To remove the plugin from Omarchy:
+```bash
+omarchy plugin remove promaa.clock --yes
+```
+To re-enable the default clock widget and restore bar placement:
+```bash
+omarchy plugin enable omarchy.clock
+omarchy bar move omarchy.clock --section center
+sed -i 's/"centerAnchor": "promaa.clock"/"centerAnchor": "omarchy.clock"/' ~/.config/omarchy/shell.json
+```
+
+### 2. Purge Token-Bearing Configuration and OAuth State
+Standard plugin removal unlinks the plugin files, but intentionally retains your configuration and cached state. To completely remove all calendar configurations (including JMAP bearer tokens), OAuth credentials, and cached event data:
+
+**Option A (Automated Purge):**
+```bash
+python3 ~/.config/omarchy/plugins/promaa.clock/fetch-events.py --purge-data
+```
+
+**Option B (Manual Removal):**
+```bash
+# Token-bearing calendar configuration (contains JMAP bearer tokens and private URLs)
+rm -f ~/.config/omarchy/calendars.json
+
+# Google OAuth2 credentials and refresh tokens
+rm -f ~/.local/state/omarchy/google-auth.json
+
+# Cached calendar event state and translation cache
+rm -f ~/.local/state/omarchy/calendar-events.json
+rm -f ~/.local/state/omarchy/translation-cache.json
+rmdir ~/.local/state/omarchy 2>/dev/null || true
+```
 
 
 ## Contributing
