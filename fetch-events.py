@@ -387,7 +387,11 @@ def parse_datetime_value(val_str, params=None):
 
     # Try datetime formats: 20260816T143000Z or 20260816T143000
     cleaned = re.sub(r"[+-]\d\d:?\d\d$", "", val_str).rstrip("Z")
-    for fmt in ("%Y%m%dT%H%M%S", "%Y%m%dT%H%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+    for fmt in (
+        "%Y%m%dT%H%M%S", "%Y%m%dT%H%M",
+        "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M"
+    ):
         try:
             dt = datetime.strptime(cleaned[:19], fmt)
         except ValueError:
@@ -831,8 +835,12 @@ def expand_multiday_event(event, window_start, window_end):
     all_day = event.get("all_day", False)
 
     start_date = start_dt.date()
-    # RFC 5545 specifies DTEND for all-day is exclusive
+    # RFC 5545 specifies DTEND is exclusive
     if all_day:
+        end_date = end_dt.date() - timedelta(days=1)
+        if end_date < start_date:
+            end_date = start_date
+    elif end_dt > start_dt and end_dt.time() == datetime.min.time():
         end_date = end_dt.date() - timedelta(days=1)
         if end_date < start_date:
             end_date = start_date
