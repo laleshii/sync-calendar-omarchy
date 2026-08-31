@@ -1,11 +1,12 @@
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
+from unittest import mock
 import stat
 import tempfile
 import unittest
-from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -362,6 +363,8 @@ class ConfigAndStateSecurityTests(unittest.TestCase):
             events_file = os.path.join(directory, "calendar-events.json")
             cache_file = os.path.join(directory, "translation-cache.json")
 
+            local_file = os.path.join(directory, "local-events.json")
+
             with open(config_file, "w") as f:
                 f.write('{"jmapToken": "secret"}')
             with open(auth_file, "w") as f:
@@ -370,11 +373,14 @@ class ConfigAndStateSecurityTests(unittest.TestCase):
                 f.write('{"events": []}')
             with open(cache_file, "w") as f:
                 f.write('{}')
+            with open(local_file, "w") as f:
+                f.write('[]')
 
             with mock.patch.object(fetch_events, "CONFIG_PATH", config_file), \
                  mock.patch.object(fetch_events, "AUTH_FILE", auth_file), \
                  mock.patch.object(fetch_events, "OUTPUT_PATH", events_file), \
                  mock.patch.object(fetch_events, "TRANSLATION_CACHE_PATH", cache_file), \
+                 mock.patch.object(fetch_events, "LOCAL_EVENTS_PATH", local_file), \
                  mock.patch.object(fetch_events, "STATE_DIR", directory):
                 res = fetch_events.purge_plugin_data()
                 self.assertEqual(res["status"], "success")
@@ -382,6 +388,259 @@ class ConfigAndStateSecurityTests(unittest.TestCase):
                 self.assertFalse(os.path.exists(auth_file))
                 self.assertFalse(os.path.exists(events_file))
                 self.assertFalse(os.path.exists(cache_file))
+                self.assertFalse(os.path.exists(local_file))
+
+
+class TwoWayEventSyncTests(unittest.TestCase):
+    def test_get_writable_calendars_filtering(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cfg_path = os.path.join(directory, "calendars.json")
+            sample_cfg = [
+                {"name": "iCal Feed", "url": "https://example.com/feed.ics", "enabled": True},
+                {"name": "My Google", "googleCalendarId": "xyz@group.calendar.google.com", "enabled": True},
+                {"name": "My JMAP", "type": "jmap", "jmapToken": "tok_123", "enabled": True},
+            ]
+            fetch_events.write_secure_json(cfg_path, sample_cfg)
+            with mock.patch.object(fetch_events, "CONFIG_PATH", cfg_path):
+                writables = fetch_events.get_writable_calendars()
+                names = [w["name"] for w in writables]
+                self.assertIn("My Google", names)
+                self.assertIn("My JMAP", names)
+                self.assertIn("Local Calendar", names)
+                self.assertNotIn("iCal Feed", names)
+
+    def test_local_calendar_crud_lifecycle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            local_path = os.path.join(directory, "local-events.json")
+            cfg_path = os.path.join(directory, "calendars.json")
+            out_path = os.path.join(directory, "calendar-events.json")
+            fetch_events.write_secure_json(cfg_path, [])
+
+            with mock.patch.object(fetch_events, "LOCAL_EVENTS_PATH", local_path), \
+                 mock.patch.object(fetch_events, "CONFIG_PATH", cfg_path), \
+                 mock.patch.object(fetch_events, "OUTPUT_PATH", out_path), \
+                 mock.patch.object(fetch_events, "STATE_DIR", directory):
+                
+                # 1. Create event
+                evt_data = {
+                    "title": "Architecture Review",
+                    "start": "2026-09-01T10:00:00",
+                    "end": "2026-09-01T11:00:00",
+                    "allDay": False,
+                    "location": "HQ Conference Room 3",
+                    "description": "Review Q3 milestone architecture",
+                    "calendar": "Local Calendar"
+                }
+                res = fetch_events.create_event(evt_data)
+                self.assertEqual(res["status"], "success")
+                event_id = res["id"]
+                self.assertTrue(event_id.startswith("loc_"))
+
+                # Verify file permissions
+                file_stat = os.stat(local_path)
+                self.assertEqual(stat.S_IMODE(file_stat.st_mode), 0o600)
+
+                # 2. Fetch local calendar
+                from datetime import datetime, timedelta
+                now = datetime(2026, 9, 1)
+                fetched = fetch_events.fetch_local_calendar(
+                    {"name": "Local Calendar", "color": "#a6e3a1"},
+                    now - timedelta(days=5),
+                    now + timedelta(days=5)
+                )
+                self.assertEqual(fetched["status"], "ok")
+                self.assertEqual(len(fetched["events"]), 1)
+                self.assertEqual(fetched["events"][0]["title"], "Architecture Review")
+                self.assertEqual(fetched["events"][0]["writable"], True)
+
+                # 3. Delete event
+                del_res = fetch_events.delete_event({"id": event_id, "calendar": "Local Calendar"})
+                self.assertEqual(del_res["status"], "success")
+
+                # Verify event is gone
+                fetched_after = fetch_events.fetch_local_calendar(
+                    {"name": "Local Calendar", "color": "#a6e3a1"},
+                    now - timedelta(days=5),
+                    now + timedelta(days=5)
+                )
+                self.assertEqual(len(fetched_after["events"]), 0)
+
+    def test_create_event_on_readonly_feed_fails_cleanly(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cfg_path = os.path.join(directory, "calendars.json")
+            sample_cfg = [{"name": "Public Holidays", "url": "https://example.com/holidays.ics", "enabled": True}]
+            fetch_events.write_secure_json(cfg_path, sample_cfg)
+
+            with mock.patch.object(fetch_events, "CONFIG_PATH", cfg_path):
+                with self.assertRaises(ValueError) as cm:
+                    fetch_events.create_event({
+                        "title": "New Event",
+                        "start": "2026-09-01T10:00:00",
+                        "calendar": "Public Holidays"
+                    })
+                self.assertIn("read-only", str(cm.exception))
+
+    def test_cli_create_and_delete_event(self):
+        with tempfile.TemporaryDirectory() as directory:
+            local_path = os.path.join(directory, "local-events.json")
+            cfg_path = os.path.join(directory, "calendars.json")
+            out_path = os.path.join(directory, "calendar-events.json")
+            fetch_events.write_secure_json(cfg_path, [])
+
+            with mock.patch.object(fetch_events, "LOCAL_EVENTS_PATH", local_path), \
+                 mock.patch.object(fetch_events, "CONFIG_PATH", cfg_path), \
+                 mock.patch.object(fetch_events, "OUTPUT_PATH", out_path), \
+                 mock.patch.object(fetch_events, "STATE_DIR", directory):
+
+                # Test --writable-calendars CLI
+                with mock.patch("sys.argv", ["fetch-events.py", "--writable-calendars"]), \
+                     self.assertRaises(SystemExit) as cm:
+                    fetch_events.main()
+                self.assertEqual(cm.exception.code, 0)
+
+                # Test --create-event CLI
+                create_payload = json.dumps({
+                    "title": "CLI Standup",
+                    "start": "2026-09-01T09:00:00",
+                    "end": "2026-09-01T09:30:00",
+                    "calendar": "Local Calendar"
+                })
+                with mock.patch("sys.argv", ["fetch-events.py", "--create-event"]), \
+                     mock.patch("sys.stdin.readline", return_value=create_payload + "\n"), \
+                     self.assertRaises(SystemExit) as cm:
+                    fetch_events.main()
+                self.assertEqual(cm.exception.code, 0)
+
+                saved_local = fetch_events.safe_load_json(local_path)
+                self.assertEqual(len(saved_local), 1)
+                evt_id = saved_local[0]["id"]
+
+                # Test --delete-event CLI
+                del_payload = json.dumps({"id": evt_id, "calendar": "Local Calendar"})
+                with mock.patch("sys.argv", ["fetch-events.py", "--delete-event"]), \
+                     mock.patch("sys.stdin.readline", return_value=del_payload + "\n"), \
+                     self.assertRaises(SystemExit) as cm:
+                    fetch_events.main()
+                self.assertEqual(cm.exception.code, 0)
+
+                saved_after = fetch_events.safe_load_json(local_path)
+                self.assertEqual(len(saved_after), 0)
+
+    def test_create_and_delete_google_event_mocked(self):
+        cal_info = {"name": "Work", "googleCalendarId": "work@domain.com"}
+        event_data = {
+            "title": "Quarterly Planning",
+            "start": "2026-09-01T14:00:00",
+            "end": "2026-09-01T15:00:00",
+            "allDay": False,
+            "location": "Boardroom",
+            "description": "Discuss Q4 goals",
+        }
+
+        with mock.patch.object(fetch_events, "get_google_access_token", return_value="mock-token"), \
+             mock.patch("urllib.request.urlopen") as mock_urlopen:
+            # Mock create response
+            resp_create = io.BytesIO(json.dumps({"id": "g_evt_999", "summary": "Quarterly Planning"}).encode("utf-8"))
+            resp_create.__enter__ = lambda s: s
+            resp_create.__exit__ = lambda s, *args: None
+
+            mock_urlopen.return_value = resp_create
+            res = fetch_events.create_google_event(cal_info, event_data)
+            self.assertEqual(res["status"], "success")
+            self.assertEqual(res["id"], "g_evt_999")
+
+            # Check request details
+            req = mock_urlopen.call_args[0][0]
+            self.assertIn("https://www.googleapis.com/calendar/v3/calendars/work%40domain.com/events", req.full_url)
+            self.assertEqual(req.get_method(), "POST")
+            sent_body = json.loads(req.data.decode("utf-8"))
+            self.assertEqual(sent_body["summary"], "Quarterly Planning")
+            self.assertEqual(sent_body["location"], "Boardroom")
+
+            # Mock delete response
+            resp_del = io.BytesIO(b"")
+            resp_del.__enter__ = lambda s: s
+            resp_del.__exit__ = lambda s, *args: None
+            mock_urlopen.return_value = resp_del
+
+            del_res = fetch_events.delete_google_event(cal_info, "g_evt_999")
+            self.assertEqual(del_res["status"], "success")
+            self.assertEqual(del_res["id"], "g_evt_999")
+            del_req = mock_urlopen.call_args[0][0]
+            self.assertEqual(del_req.get_method(), "DELETE")
+            self.assertIn("/events/g_evt_999", del_req.full_url)
+
+    def test_create_and_delete_jmap_event_mocked(self):
+        cal_info = {"name": "Fastmail", "type": "jmap", "jmapToken": "jmap-tok", "jmapUrl": "https://api.fastmail.com/jmap/session"}
+        event_data = {
+            "title": "Design Sync",
+            "start": "2026-09-01T11:00:00",
+            "end": "2026-09-01T12:00:00",
+            "allDay": False,
+            "location": "Online",
+            "description": "Figma review",
+        }
+
+        session_resp_bytes = json.dumps({
+            "apiUrl": "https://api.fastmail.com/jmap/api",
+            "primaryAccounts": {"urn:ietf:params:jmap:calendars": "acc_123"},
+            "capabilities": {"urn:ietf:params:jmap:calendars": {}}
+        }).encode("utf-8")
+
+        set_resp_bytes = json.dumps({
+            "methodResponses": [
+                [
+                    "CalendarEvent/set",
+                    {
+                        "accountId": "acc_123",
+                        "created": {
+                            "c_cid": {"id": "jmap_evt_456", "title": "Design Sync"}
+                        }
+                    },
+                    "set0"
+                ]
+            ]
+        }).encode("utf-8")
+
+        del_resp_bytes = json.dumps({
+            "methodResponses": [
+                [
+                    "CalendarEvent/set",
+                    {
+                        "accountId": "acc_123",
+                        "destroyed": ["jmap_evt_456"]
+                    },
+                    "del0"
+                ]
+            ]
+        }).encode("utf-8")
+
+        def make_stream(b):
+            s = io.BytesIO(b)
+            s.__enter__ = lambda self: self
+            s.__exit__ = lambda self, *args: None
+            return s
+
+        s1 = make_stream(session_resp_bytes)
+        s2 = make_stream(set_resp_bytes)
+        s3 = make_stream(session_resp_bytes)
+        s4 = make_stream(del_resp_bytes)
+
+        with mock.patch.object(fetch_events, "open_trusted_jmap", side_effect=[s1, s2, s3, s4]), \
+             mock.patch.object(fetch_events, "secrets") as mock_secrets:
+            mock_secrets.token_hex.return_value = "cid"
+            create_res = fetch_events.create_jmap_event(cal_info, event_data)
+            self.assertEqual(create_res["status"], "success")
+            self.assertEqual(create_res["id"], "jmap_evt_456")
+
+            del_res = fetch_events.delete_jmap_event(cal_info, "jmap_evt_456")
+            self.assertEqual(del_res["status"], "success")
+            self.assertEqual(del_res["id"], "jmap_evt_456")
+
+        # Also test format_duration_iso helper
+        self.assertEqual(fetch_events.format_duration_iso(3600), "PT1H")
+        self.assertEqual(fetch_events.format_duration_iso(1800), "PT30M")
+        self.assertEqual(fetch_events.format_duration_iso(5400), "PT1H30M")
 
 
 if __name__ == "__main__":

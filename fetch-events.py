@@ -28,6 +28,7 @@ CONFIG_PATH = os.path.expanduser("~/.config/omarchy/calendars.json")
 STATE_DIR = os.path.expanduser("~/.local/state/omarchy")
 OUTPUT_PATH = os.path.join(STATE_DIR, "calendar-events.json")
 TRANSLATION_CACHE_PATH = os.path.join(STATE_DIR, "translation-cache.json")
+LOCAL_EVENTS_PATH = os.path.join(STATE_DIR, "local-events.json")
 
 # Standard browser user-agent to ensure compatibility with calendar providers (Apple iCloud, Proton, Google, Outlook, Nextcloud, etc.)
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 (OmarchyCalendar/1.0)"
@@ -1588,7 +1589,9 @@ def fetch_jmap_calendar(cal_info, window_start, window_end):
 
 def fetch_calendar_item(cal_info, window_start, window_end):
     cal_type = str(cal_info.get("type", "")).lower()
-    if cal_type == "jmap" or cal_info.get("jmapToken") or ("jmap" in cal_info.get("url", "").lower() and "jmapToken" in cal_info):
+    if cal_type == "local":
+        return fetch_local_calendar(cal_info, window_start, window_end)
+    elif cal_type == "jmap" or cal_info.get("jmapToken") or ("jmap" in cal_info.get("url", "").lower() and "jmapToken" in cal_info):
         return fetch_jmap_calendar(cal_info, window_start, window_end)
     elif cal_info.get("googleCalendarId") or (cal_info.get("calendarId") and not cal_info.get("jmapToken")):
         return fetch_google_api_calendar(cal_info, window_start, window_end)
@@ -1603,6 +1606,7 @@ def purge_plugin_data():
     - AUTH_FILE (~/.local/state/omarchy/google-auth.json)
     - OUTPUT_PATH (~/.local/state/omarchy/calendar-events.json)
     - TRANSLATION_CACHE_PATH (~/.local/state/omarchy/translation-cache.json)
+    - LOCAL_EVENTS_PATH (~/.local/state/omarchy/local-events.json)
     """
     removed = []
     errors = []
@@ -1611,6 +1615,7 @@ def purge_plugin_data():
         AUTH_FILE,
         OUTPUT_PATH,
         TRANSLATION_CACHE_PATH,
+        LOCAL_EVENTS_PATH,
     ]
     for target in targets:
         try:
@@ -1634,58 +1639,658 @@ def purge_plugin_data():
     }
 
 
-def main():
-    if len(sys.argv) > 1:
-        arg = sys.argv[1]
-        if arg in ("--purge-data", "--purge-auth", "--cleanup", "--uninstall"):
-            res = purge_plugin_data()
-            print(json.dumps(res, indent=2))
-            sys.exit(0 if res["status"] == "success" else 1)
+def format_duration_iso(seconds):
+    """Format duration in seconds to ISO 8601 duration (e.g. PT1H, PT30M)."""
+    if seconds <= 0:
+        return "PT0S"
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+    res = "PT"
+    if hours > 0:
+        res += f"{hours}H"
+    if minutes > 0:
+        res += f"{minutes}M"
+    if secs > 0 or res == "PT":
+        res += f"{secs}S"
+    return res
 
+
+def get_local_tz_name():
+    """Detect local IANA timezone name."""
+    try:
+        if os.path.exists("/etc/localtime") and os.path.islink("/etc/localtime"):
+            target = os.readlink("/etc/localtime")
+            parts = target.split("zoneinfo/")
+            if len(parts) > 1:
+                return parts[1]
+    except Exception:
+        pass
+    try:
+        return time.tzname[0]
+    except Exception:
+        return "UTC"
+
+
+def parse_iso_or_local(val_str):
+    """Parse an ISO 8601 or local timestamp string into datetime."""
+    if not val_str:
+        return datetime.now()
+    clean_str = str(val_str).strip()
+    if clean_str.endswith("Z"):
+        clean_str = clean_str[:-1]
+    for fmt in (
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d",
+    ):
+        try:
+            return datetime.strptime(clean_str, fmt)
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(clean_str)
+    except Exception:
+        return datetime.now()
+
+
+def fetch_local_calendar(cal_info, window_start, window_end):
+    """Fetch events stored locally in ~/.local/state/omarchy/local-events.json"""
+    name = cal_info.get("name", "Local Calendar")
+    color = cal_info.get("color", "#a6e3a1")
+    raw_events = safe_load_json(LOCAL_EVENTS_PATH, max_bytes=MAX_OUTPUT_JSON_BYTES) or []
+    if not isinstance(raw_events, list):
+        raw_events = []
+
+    auto_translate = cal_info.get("translateKorean", False)
+    events = []
+
+    for item in raw_events:
+        title = item.get("title") or "(Untitled Event)"
+        description = item.get("description") or ""
+        location = item.get("location") or ""
+        all_day = bool(item.get("allDay", False))
+
+        if auto_translate:
+            title = translate_korean_to_english(title)
+            location = translate_korean_to_english(location)
+
+        meeting_url, meeting_provider = extract_meeting_info(location, description, title)
+
+        start_str = item.get("start")
+        if not start_str:
+            continue
+
+        start_dt = parse_iso_or_local(start_str)
+        end_str = item.get("end")
+        if end_str:
+            end_dt = parse_iso_or_local(end_str)
+        elif all_day:
+            end_dt = start_dt + timedelta(days=1)
+        else:
+            end_dt = start_dt + timedelta(hours=1)
+
+        evt = {
+            "id": str(item.get("id", f"local_{int(start_dt.timestamp())}")),
+            "title": title,
+            "location": location,
+            "description": description,
+            "calendar": name,
+            "calendarId": "local",
+            "calendarType": "local",
+            "writable": True,
+            "color": color,
+            "all_day": all_day,
+            "start_dt": start_dt,
+            "end_dt": end_dt,
+            "date_key": start_dt.strftime("%Y-%m-%d"),
+            "meetingUrl": meeting_url or "",
+            "meetingProvider": meeting_provider or "",
+            "rrule": None,
+            "exdates": [],
+        }
+
+        multidays = expand_multiday_event(evt, window_start, window_end)
+        for inst in multidays:
+            inst_dt = datetime.strptime(inst["date_key"], "%Y-%m-%d")
+            if window_start <= inst_dt <= window_end:
+                events.append(inst)
+
+    return {
+        "name": name,
+        "color": color,
+        "type": "local",
+        "writable": True,
+        "events": events,
+        "status": "ok",
+        "count": len(events),
+    }
+
+
+def create_local_event(cal_info, event_data):
+    """Create a local event in ~/.local/state/omarchy/local-events.json"""
+    events = safe_load_json(LOCAL_EVENTS_PATH, max_bytes=MAX_OUTPUT_JSON_BYTES) or []
+    if not isinstance(events, list):
+        events = []
+
+    title = str(event_data.get("title", "")).strip() or "(Untitled Event)"
+    location = str(event_data.get("location", "")).strip()
+    description = str(event_data.get("description", "")).strip()
+    all_day = bool(event_data.get("allDay", False))
+    start_str = str(event_data.get("start", "")).strip()
+    end_str = str(event_data.get("end", "")).strip()
+
+    if not start_str:
+        raise ValueError("Event must have a start date/time")
+
+    event_id = f"loc_{int(time.time())}_{secrets.token_hex(4)}"
+    new_evt = {
+        "id": event_id,
+        "title": title,
+        "start": start_str,
+        "end": end_str,
+        "allDay": all_day,
+        "location": location,
+        "description": description,
+        "calendar": cal_info.get("name", "Local Calendar"),
+        "createdAt": int(time.time()),
+    }
+    events.append(new_evt)
+    write_secure_json(LOCAL_EVENTS_PATH, events, mode=0o600, max_bytes=MAX_OUTPUT_JSON_BYTES)
+    return {"status": "success", "id": event_id, "event": new_evt}
+
+
+def delete_local_event(cal_info, event_id):
+    """Delete a local event from ~/.local/state/omarchy/local-events.json"""
+    events = safe_load_json(LOCAL_EVENTS_PATH, max_bytes=MAX_OUTPUT_JSON_BYTES) or []
+    if not isinstance(events, list):
+        events = []
+
+    filtered = [e for e in events if str(e.get("id")) != str(event_id)]
+    if len(filtered) == len(events):
+        return {"status": "error", "message": f"Event '{event_id}' not found in local calendar"}
+
+    write_secure_json(LOCAL_EVENTS_PATH, filtered, mode=0o600, max_bytes=MAX_OUTPUT_JSON_BYTES)
+    return {"status": "success", "id": event_id}
+
+
+def create_google_event(cal_info, event_data):
+    """Create an event on Google Calendar using Google Calendar API v3."""
+    cal_id = cal_info.get("googleCalendarId") or cal_info.get("calendarId")
+    if not cal_id:
+        raise ValueError("Google calendar has no calendar ID configured")
+
+    access_token = get_google_access_token()
+    if not access_token:
+        raise ValueError("Google authentication required: run google-auth.py")
+
+    title = str(event_data.get("title", "")).strip() or "(Untitled Event)"
+    location = str(event_data.get("location", "")).strip()
+    description = str(event_data.get("description", "")).strip()
+    all_day = bool(event_data.get("allDay", False))
+
+    start_val = str(event_data.get("start", "")).strip()
+    end_val = str(event_data.get("end", "")).strip()
+    if not start_val:
+        raise ValueError("Event must have a start date/time")
+
+    body = {
+        "summary": title,
+    }
+    if description:
+        body["description"] = description
+    if location:
+        body["location"] = location
+
+    tz_name = get_local_tz_name()
+
+    if all_day:
+        d_start = start_val[:10]
+        d_end = end_val[:10] if end_val else d_start
+        try:
+            end_dt = datetime.strptime(d_end, "%Y-%m-%d") + timedelta(days=1)
+            end_date_str = end_dt.strftime("%Y-%m-%d")
+        except Exception:
+            end_date_str = d_start
+        body["start"] = {"date": d_start}
+        body["end"] = {"date": end_date_str}
+    else:
+        start_dt = parse_iso_or_local(start_val)
+        if end_val:
+            end_dt = parse_iso_or_local(end_val)
+        else:
+            end_dt = start_dt + timedelta(hours=1)
+
+        start_iso = start_dt.astimezone().isoformat()
+        end_iso = end_dt.astimezone().isoformat()
+
+        body["start"] = {"dateTime": start_iso}
+        body["end"] = {"dateTime": end_iso}
+        if tz_name:
+            body["start"]["timeZone"] = tz_name
+            body["end"]["timeZone"] = tz_name
+
+    encoded_cal_id = urllib.parse.quote(cal_id, safe="")
+    url = f"https://www.googleapis.com/calendar/v3/calendars/{encoded_cal_id}/events"
+    req_data = json.dumps(body).encode("utf-8")
+
+    req = urllib.request.Request(
+        url,
+        data=req_data,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "User-Agent": USER_AGENT,
+            "Content-Type": "application/json",
+        },
+        method="POST"
+    )
+
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        raw = safe_read_bytes(resp, max_bytes=MAX_API_BYTES)
+        created_data = json.loads(raw.decode("utf-8"))
+        return {"status": "success", "id": created_data.get("id"), "event": created_data}
+
+
+def delete_google_event(cal_info, event_id):
+    """Delete an event from Google Calendar API v3."""
+    cal_id = cal_info.get("googleCalendarId") or cal_info.get("calendarId")
+    if not cal_id:
+        raise ValueError("Google calendar has no calendar ID configured")
+
+    access_token = get_google_access_token()
+    if not access_token:
+        raise ValueError("Google authentication required: run google-auth.py")
+
+    encoded_cal_id = urllib.parse.quote(cal_id, safe="")
+    encoded_evt_id = urllib.parse.quote(str(event_id), safe="")
+    url = f"https://www.googleapis.com/calendar/v3/calendars/{encoded_cal_id}/events/{encoded_evt_id}"
+
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "User-Agent": USER_AGENT,
+        },
+        method="DELETE"
+    )
+
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return {"status": "success", "id": event_id}
+
+
+def create_jmap_event(cal_info, event_data):
+    """Create an event on a JMAP server (RFC 8620, RFC 9670, RFC 8984 JSCalendar)."""
+    token = (cal_info.get("jmapToken") or cal_info.get("token") or cal_info.get("bearerToken") or "").strip()
+    session_url = (cal_info.get("jmapUrl") or cal_info.get("sessionUrl") or cal_info.get("url") or "").strip()
+
+    if not session_url:
+        session_url = "https://api.fastmail.com/jmap/session"
+    elif "://" not in session_url:
+        session_url = "https://" + session_url
+
+    parsed = urllib.parse.urlsplit(session_url)
+    if not parsed.path or parsed.path == "/":
+        session_url = urllib.parse.urlunsplit(parsed._replace(path="/.well-known/jmap"))
+
+    if not token:
+        raise ValueError("No JMAP bearer token configured")
+
+    session_url, trusted_origin = validate_jmap_https_url(session_url)
+    opener = urllib.request.build_opener(JmapSameOriginRedirectHandler(trusted_origin))
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+
+    # Step 1: Session Discovery
+    req = urllib.request.Request(session_url, headers=headers, method="GET")
+    with open_trusted_jmap(opener, req, trusted_origin, timeout=12) as resp:
+        raw_session = safe_read_bytes(resp, max_bytes=MAX_API_BYTES)
+        session_data = json.loads(raw_session.decode("utf-8"))
+
+    api_url = session_data.get("apiUrl")
+    if not api_url:
+        raise ValueError("No apiUrl in JMAP session response")
+    api_url, _ = validate_jmap_https_url(api_url, trusted_origin)
+
+    accounts = session_data.get("accounts", {})
+    primary_accounts = session_data.get("primaryAccounts", {})
+    account_id = primary_accounts.get("urn:ietf:params:jmap:calendars")
+
+    if not account_id:
+        for acc_id, acc_val in accounts.items():
+            caps = acc_val.get("accountCapabilities", {})
+            if any("calendar" in k.lower() for k in caps.keys()):
+                account_id = acc_id
+                break
+
+    if not account_id and accounts:
+        account_id = next(iter(accounts.keys()))
+
+    if not account_id:
+        raise ValueError("No JMAP calendar account found")
+
+    title = str(event_data.get("title", "")).strip() or "(Untitled Event)"
+    location = str(event_data.get("location", "")).strip()
+    description = str(event_data.get("description", "")).strip()
+    all_day = bool(event_data.get("allDay", False))
+
+    start_val = str(event_data.get("start", "")).strip()
+    end_val = str(event_data.get("end", "")).strip()
+    if not start_val:
+        raise ValueError("Event must have a start date/time")
+
+    tz_name = get_local_tz_name()
+
+    jsevent = {
+        "@type": "Event",
+        "title": title,
+        "description": description,
+        "showWithoutTime": all_day,
+    }
+    if location:
+        jsevent["locations"] = {"loc1": {"@type": "Location", "name": location}}
+
+    if all_day:
+        d_start = start_val[:10]
+        jsevent["start"] = d_start
+        jsevent["duration"] = "P1D"
+    else:
+        start_dt = parse_iso_or_local(start_val)
+        if end_val:
+            end_dt = parse_iso_or_local(end_val)
+        else:
+            end_dt = start_dt + timedelta(hours=1)
+        dur_seconds = max(60, int((end_dt - start_dt).total_seconds()))
+        dur_str = format_duration_iso(dur_seconds)
+
+        jsevent["start"] = start_dt.strftime("%Y-%m-%dT%H:%M:%S")
+        if tz_name:
+            jsevent["timeZone"] = tz_name
+        jsevent["duration"] = dur_str
+
+    cal_id = cal_info.get("jmapCalendarId") or cal_info.get("calendarId")
+    if cal_id and cal_id != "primary":
+        jsevent["calendarIds"] = {cal_id: True}
+
+    jmap_using = ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:calendars"]
+    session_caps = session_data.get("capabilities", {})
+    for cap in session_caps:
+        if "calendar" in cap.lower() and cap not in jmap_using:
+            jmap_using.append(cap)
+
+    creation_id = f"c_{secrets.token_hex(4)}"
+    payload = {
+        "using": jmap_using,
+        "methodCalls": [
+            [
+                "CalendarEvent/set",
+                {
+                    "accountId": account_id,
+                    "create": {
+                        creation_id: jsevent
+                    }
+                },
+                "set0"
+            ]
+        ]
+    }
+
+    payload_bytes = json.dumps(payload).encode("utf-8")
+    post_req = urllib.request.Request(api_url, data=payload_bytes, headers=headers, method="POST")
+
+    with open_trusted_jmap(opener, post_req, trusted_origin, timeout=15) as resp:
+        raw_data = safe_read_bytes(resp, max_bytes=MAX_API_BYTES)
+        response_data = json.loads(raw_data.decode("utf-8"))
+
+    method_responses = response_data.get("methodResponses", [])
+    for resp_name, resp_args, resp_call_id in method_responses:
+        if resp_name == "CalendarEvent/set":
+            created_map = resp_args.get("created", {})
+            if creation_id in created_map:
+                created_evt = created_map[creation_id]
+                return {"status": "success", "id": created_evt.get("id"), "event": created_evt}
+            not_created = resp_args.get("notCreated", {})
+            if creation_id in not_created:
+                err_desc = not_created[creation_id].get("description") or not_created[creation_id].get("type")
+                raise ValueError(f"JMAP event creation rejected: {err_desc}")
+        elif resp_name == "error":
+            raise ValueError(f"JMAP error: {resp_args.get('type')}")
+
+    return {"status": "success", "id": creation_id}
+
+
+def delete_jmap_event(cal_info, event_id):
+    """Delete an event on a JMAP server using CalendarEvent/set destroy."""
+    token = (cal_info.get("jmapToken") or cal_info.get("token") or cal_info.get("bearerToken") or "").strip()
+    session_url = (cal_info.get("jmapUrl") or cal_info.get("sessionUrl") or cal_info.get("url") or "").strip()
+
+    if not session_url:
+        session_url = "https://api.fastmail.com/jmap/session"
+    elif "://" not in session_url:
+        session_url = "https://" + session_url
+
+    parsed = urllib.parse.urlsplit(session_url)
+    if not parsed.path or parsed.path == "/":
+        session_url = urllib.parse.urlunsplit(parsed._replace(path="/.well-known/jmap"))
+
+    if not token:
+        raise ValueError("No JMAP bearer token configured")
+
+    session_url, trusted_origin = validate_jmap_https_url(session_url)
+    opener = urllib.request.build_opener(JmapSameOriginRedirectHandler(trusted_origin))
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+
+    req = urllib.request.Request(session_url, headers=headers, method="GET")
+    with open_trusted_jmap(opener, req, trusted_origin, timeout=12) as resp:
+        raw_session = safe_read_bytes(resp, max_bytes=MAX_API_BYTES)
+        session_data = json.loads(raw_session.decode("utf-8"))
+
+    api_url = session_data.get("apiUrl")
+    if not api_url:
+        raise ValueError("No apiUrl in JMAP session response")
+    api_url, _ = validate_jmap_https_url(api_url, trusted_origin)
+
+    accounts = session_data.get("accounts", {})
+    primary_accounts = session_data.get("primaryAccounts", {})
+    account_id = primary_accounts.get("urn:ietf:params:jmap:calendars")
+    if not account_id:
+        for acc_id, acc_val in accounts.items():
+            caps = acc_val.get("accountCapabilities", {})
+            if any("calendar" in k.lower() for k in caps.keys()):
+                account_id = acc_id
+                break
+    if not account_id and accounts:
+        account_id = next(iter(accounts.keys()))
+    if not account_id:
+        raise ValueError("No JMAP calendar account found")
+
+    jmap_using = ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:calendars"]
+    session_caps = session_data.get("capabilities", {})
+    for cap in session_caps:
+        if "calendar" in cap.lower() and cap not in jmap_using:
+            jmap_using.append(cap)
+
+    payload = {
+        "using": jmap_using,
+        "methodCalls": [
+            [
+                "CalendarEvent/set",
+                {
+                    "accountId": account_id,
+                    "destroy": [str(event_id)]
+                },
+                "del0"
+            ]
+        ]
+    }
+
+    payload_bytes = json.dumps(payload).encode("utf-8")
+    post_req = urllib.request.Request(api_url, data=payload_bytes, headers=headers, method="POST")
+
+    with open_trusted_jmap(opener, post_req, trusted_origin, timeout=15) as resp:
+        raw_data = safe_read_bytes(resp, max_bytes=MAX_API_BYTES)
+        response_data = json.loads(raw_data.decode("utf-8"))
+
+    method_responses = response_data.get("methodResponses", [])
+    for resp_name, resp_args, resp_call_id in method_responses:
+        if resp_name == "CalendarEvent/set":
+            destroyed = resp_args.get("destroyed", [])
+            if str(event_id) in [str(d) for d in destroyed]:
+                return {"status": "success", "id": event_id}
+            not_destroyed = resp_args.get("notDestroyed", {})
+            if str(event_id) in not_destroyed:
+                err_desc = not_destroyed[str(event_id)].get("description") or not_destroyed[str(event_id)].get("type")
+                raise ValueError(f"JMAP event deletion rejected: {err_desc}")
+        elif resp_name == "error":
+            raise ValueError(f"JMAP error: {resp_args.get('type')}")
+
+    return {"status": "success", "id": event_id}
+
+
+def find_calendar_config(cal_name_or_id):
+    """Find calendar entry matching name or ID from config, or default to local."""
+    ensure_config_exists()
+    calendars = safe_load_json(CONFIG_PATH, max_bytes=MAX_CONFIG_BYTES) or []
+    target = str(cal_name_or_id or "").strip().lower()
+
+    if target in ("", "local", "local calendar"):
+        for c in calendars:
+            if str(c.get("type", "")).lower() == "local":
+                return c
+        return {"name": "Local Calendar", "type": "local", "color": "#a6e3a1", "enabled": True}
+
+    for c in calendars:
+        c_name = str(c.get("name", "")).strip().lower()
+        c_gid = str(c.get("googleCalendarId", "")).strip().lower()
+        c_id = str(c.get("calendarId", "")).strip().lower()
+        if target in (c_name, c_gid, c_id):
+            return c
+
+    return {"name": cal_name_or_id or "Local Calendar", "type": "local", "color": "#a6e3a1", "enabled": True}
+
+
+def create_event(event_data):
+    """Dispatcher to create an event on the specified calendar."""
+    cal_target = event_data.get("calendar") or event_data.get("calendarId") or "local"
+    cal_info = find_calendar_config(cal_target)
+    cal_type = str(cal_info.get("type", "")).lower()
+
+    if cal_type == "local" or str(cal_target).lower() in ("local", "local calendar"):
+        res = create_local_event(cal_info, event_data)
+    elif cal_type == "jmap" or cal_info.get("jmapToken"):
+        res = create_jmap_event(cal_info, event_data)
+    elif cal_info.get("googleCalendarId") or (cal_info.get("calendarId") and not cal_info.get("url")):
+        res = create_google_event(cal_info, event_data)
+    else:
+        raise ValueError(f"Calendar '{cal_info.get('name')}' is a read-only subscription feed and does not accept push events.")
+
+    sync_all_events()
+    return res
+
+
+def delete_event(delete_data):
+    """Dispatcher to delete an event from the specified calendar."""
+    event_id = delete_data.get("id")
+    if not event_id:
+        raise ValueError("Missing event ID for deletion")
+
+    cal_target = delete_data.get("calendar") or delete_data.get("calendarId") or delete_data.get("calendarType") or "local"
+    cal_type = str(delete_data.get("calendarType", "")).lower()
+
+    if not cal_type:
+        cal_info = find_calendar_config(cal_target)
+        cal_type = str(cal_info.get("type", "")).lower()
+        if not cal_type:
+            if cal_info.get("googleCalendarId"):
+                cal_type = "google"
+            elif cal_info.get("jmapToken"):
+                cal_type = "jmap"
+            else:
+                cal_type = "local"
+    else:
+        cal_info = find_calendar_config(cal_target)
+
+    if cal_type == "local" or str(event_id).startswith("loc_") or str(event_id).startswith("local_"):
+        res = delete_local_event(cal_info, event_id)
+    elif cal_type == "jmap":
+        res = delete_jmap_event(cal_info, event_id)
+    elif cal_type == "google":
+        res = delete_google_event(cal_info, event_id)
+    else:
+        raise ValueError(f"Calendar '{cal_target}' does not support event deletion (read-only feed).")
+
+    sync_all_events()
+    return res
+
+
+def get_writable_calendars():
+    """Returns a list of calendars configured or available for writing events."""
+    ensure_config_exists()
+    calendars = safe_load_json(CONFIG_PATH, max_bytes=MAX_CONFIG_BYTES) or []
+    writables = []
+    has_local = False
+
+    for c in calendars:
+        c_type = str(c.get("type", "")).lower()
+        if c_type == "local":
+            has_local = True
+            writables.append({
+                "name": c.get("name", "Local Calendar"),
+                "type": "local",
+                "color": c.get("color", "#a6e3a1"),
+                "calendarId": "local",
+                "writable": True,
+            })
+        elif c_type == "jmap" or c.get("jmapToken"):
+            writables.append({
+                "name": c.get("name", "JMAP Calendar"),
+                "type": "jmap",
+                "color": c.get("color", "#ff7700"),
+                "calendarId": c.get("jmapCalendarId") or c.get("calendarId") or "primary",
+                "writable": True,
+            })
+        elif c.get("googleCalendarId") or (c.get("calendarId") and not c.get("url")):
+            writables.append({
+                "name": c.get("name", "Google Calendar"),
+                "type": "google",
+                "color": c.get("color", "#4285f4"),
+                "calendarId": c.get("googleCalendarId") or c.get("calendarId"),
+                "writable": True,
+            })
+
+    if not has_local:
+        writables.append({
+            "name": "Local Calendar",
+            "type": "local",
+            "color": "#a6e3a1",
+            "calendarId": "local",
+            "writable": True,
+        })
+
+    return writables
+
+
+def sync_all_events():
+    """Fetch all configured and local calendars and write calendar-events.json."""
     ensure_config_exists()
     os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
     load_translation_cache()
-
-    if len(sys.argv) > 1:
-        arg = sys.argv[1]
-        if arg == "--save-config":
-            try:
-                if len(sys.argv) > 2:
-                    raw_input = sys.argv[2]
-                else:
-                    raw_input = sys.stdin.readline()
-                    if not raw_input.strip():
-                        raw_input = sys.stdin.read(MAX_CONFIG_BYTES + 1)
-                if len(raw_input) > MAX_CONFIG_BYTES:
-                    raise ValueError(f"Config payload exceeds maximum size of {MAX_CONFIG_BYTES} bytes")
-                new_config = json.loads(raw_input)
-                if not isinstance(new_config, list):
-                    raise ValueError("Config must be a JSON array of calendar entries")
-                write_secure_json(CONFIG_PATH, new_config, mode=0o600)
-                print(json.dumps({"status": "success"}))
-                sys.exit(0)
-            except Exception as e:
-                print(json.dumps({"status": "error", "message": str(e)}))
-                sys.exit(1)
-        elif arg == "--get-config":
-            ensure_config_exists()
-            content = safe_load_json(CONFIG_PATH, max_bytes=MAX_CONFIG_BYTES)
-            print(json.dumps(content, ensure_ascii=False, indent=2))
-            sys.exit(0)
-        elif arg == "--auth-status":
-            auth_ok = False
-            auth_data = safe_load_json(AUTH_FILE, max_bytes=MAX_CONFIG_BYTES)
-            if auth_data and auth_data.get("refresh_token") and auth_data.get("client_id"):
-                auth_ok = True
-            print(json.dumps({"authenticated": auth_ok}))
-            sys.exit(0)
 
     try:
         calendars = safe_load_json(CONFIG_PATH, max_bytes=MAX_CONFIG_BYTES) or []
     except Exception:
         calendars = []
 
-    # Time window: 45 days ago to 90 days in the future
     now = datetime.now()
     window_start = now - timedelta(days=45)
     window_end = now + timedelta(days=90)
@@ -1697,9 +2302,24 @@ def main():
             c.get("googleCalendarId") or
             c.get("calendarId") or
             c.get("jmapToken") or
-            c.get("type") == "jmap"
+            str(c.get("type", "")).lower() == "jmap" or
+            str(c.get("type", "")).lower() == "local"
         )
     ]
+
+    has_local = any(str(c.get("type", "")).lower() == "local" for c in enabled_cals)
+    if not has_local and os.path.exists(LOCAL_EVENTS_PATH):
+        try:
+            local_evts = safe_load_json(LOCAL_EVENTS_PATH, max_bytes=MAX_OUTPUT_JSON_BYTES)
+            if local_evts and len(local_evts) > 0:
+                enabled_cals.append({
+                    "name": "Local Calendar",
+                    "type": "local",
+                    "color": "#a6e3a1",
+                    "enabled": True,
+                })
+        except Exception:
+            pass
 
     all_events = []
     cal_statuses = []
@@ -1716,11 +2336,12 @@ def main():
                 cal_statuses.append({
                     "name": res["name"],
                     "color": res["color"],
+                    "type": res.get("type", "ical"),
+                    "writable": bool(res.get("writable", False)),
                     "status": res["status"],
                     "count": res["count"],
                 })
 
-    # Group events by date key ("YYYY-MM-DD")
     events_by_date = {}
     for evt in all_events:
         d_key = evt["date_key"]
@@ -1734,6 +2355,10 @@ def main():
             "id": evt["id"],
             "title": evt["title"],
             "calendar": evt["calendar"],
+            "calendarId": evt.get("calendarId", ""),
+            "calendarType": evt.get("calendarType", "ical"),
+            "writable": bool(evt.get("writable", False)),
+            "description": evt.get("description", ""),
             "color": evt["color"],
             "allDay": evt["all_day"],
             "startTime": start_time_str if not evt["all_day"] else "All Day",
@@ -1744,7 +2369,6 @@ def main():
             "meetingProvider": evt.get("meetingProvider") or "",
         })
 
-    # Sort events in each day: All day events first, then chronological
     for d_key in events_by_date:
         events_by_date[d_key].sort(
             key=lambda x: (0 if x["allDay"] else 1, x["startTime"], x["title"])
@@ -1771,11 +2395,106 @@ def main():
     write_secure_json(OUTPUT_PATH, output_data, mode=0o600, max_bytes=MAX_OUTPUT_JSON_BYTES)
     save_translation_cache()
 
-    print(json.dumps({
+    return {
         "status": "success",
         "totalEvents": len(all_events),
         "calendars": len(cal_statuses),
-    }))
+    }
+
+
+def read_stdin_payload(max_bytes=MAX_CONFIG_BYTES):
+    """Read JSON payload from stdin safely without blocking or deadlock."""
+    try:
+        line = sys.stdin.readline()
+        if line and line.strip():
+            return line
+    except Exception:
+        pass
+    try:
+        return sys.stdin.read(max_bytes + 1)
+    except Exception:
+        return ""
+
+
+def main():
+    if len(sys.argv) > 1:
+        arg = sys.argv[1]
+        if arg in ("--purge-data", "--purge-auth", "--cleanup", "--uninstall"):
+            res = purge_plugin_data()
+            print(json.dumps(res, indent=2))
+            sys.exit(0 if res["status"] == "success" else 1)
+
+    ensure_config_exists()
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    load_translation_cache()
+
+    if len(sys.argv) > 1:
+        arg = sys.argv[1]
+        if arg == "--save-config":
+            try:
+                raw_input = sys.argv[2] if len(sys.argv) > 2 else read_stdin_payload(MAX_CONFIG_BYTES)
+                if len(raw_input) > MAX_CONFIG_BYTES:
+                    raise ValueError(f"Config payload exceeds maximum size of {MAX_CONFIG_BYTES} bytes")
+                new_config = json.loads(raw_input)
+                if not isinstance(new_config, list):
+                    raise ValueError("Config must be a JSON array of calendar entries")
+                write_secure_json(CONFIG_PATH, new_config, mode=0o600)
+                print(json.dumps({"status": "success"}))
+                sys.exit(0)
+            except Exception as e:
+                print(json.dumps({"status": "error", "message": str(e)}))
+                sys.exit(1)
+        elif arg == "--get-config":
+            ensure_config_exists()
+            content = safe_load_json(CONFIG_PATH, max_bytes=MAX_CONFIG_BYTES)
+            print(json.dumps(content, ensure_ascii=False, indent=2))
+            sys.exit(0)
+        elif arg == "--auth-status":
+            auth_ok = False
+            auth_data = safe_load_json(AUTH_FILE, max_bytes=MAX_CONFIG_BYTES)
+            if auth_data and auth_data.get("refresh_token") and auth_data.get("client_id"):
+                auth_ok = True
+            print(json.dumps({"authenticated": auth_ok}))
+            sys.exit(0)
+        elif arg == "--create-event":
+            try:
+                raw_input = sys.argv[2] if len(sys.argv) > 2 else read_stdin_payload(MAX_CONFIG_BYTES)
+                if len(raw_input) > MAX_CONFIG_BYTES:
+                    raise ValueError(f"Payload exceeds maximum size of {MAX_CONFIG_BYTES} bytes")
+                event_data = json.loads(raw_input)
+                if not isinstance(event_data, dict):
+                    raise ValueError("Payload must be a JSON object")
+                res = create_event(event_data)
+                print(json.dumps(res, ensure_ascii=False))
+                sys.exit(0 if res.get("status") == "success" else 1)
+            except Exception as e:
+                print(json.dumps({"status": "error", "message": str(e)}))
+                sys.exit(1)
+        elif arg == "--delete-event":
+            try:
+                raw_input = sys.argv[2] if len(sys.argv) > 2 else read_stdin_payload(MAX_CONFIG_BYTES)
+                if len(raw_input) > MAX_CONFIG_BYTES:
+                    raise ValueError(f"Payload exceeds maximum size of {MAX_CONFIG_BYTES} bytes")
+                delete_data = json.loads(raw_input)
+                if not isinstance(delete_data, dict):
+                    raise ValueError("Payload must be a JSON object")
+                res = delete_event(delete_data)
+                print(json.dumps(res, ensure_ascii=False))
+                sys.exit(0 if res.get("status") == "success" else 1)
+            except Exception as e:
+                print(json.dumps({"status": "error", "message": str(e)}))
+                sys.exit(1)
+        elif arg == "--writable-calendars":
+            try:
+                writables = get_writable_calendars()
+                print(json.dumps(writables, ensure_ascii=False, indent=2))
+                sys.exit(0)
+            except Exception as e:
+                print(json.dumps({"status": "error", "message": str(e)}))
+                sys.exit(1)
+
+    result = sync_all_events()
+    print(json.dumps(result))
 
 
 if __name__ == "__main__":

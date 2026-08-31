@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "promaa.clock",
   "name": "Calendar Sync Clock",
-  "version": "1.2.2",
+  "version": "1.3.0",
   "author": "promaaa",
   "license": "MIT",
-  "description": "Date/time label with an interactive calendar popup and universal iCalendar (.ics / webcal) & JMAP sync",
+  "description": "Date/time label with an interactive calendar popup, two-way event sync & push, and universal iCalendar (.ics / webcal) & JMAP sync",
   "kinds": [
     "bar-widget"
   ],

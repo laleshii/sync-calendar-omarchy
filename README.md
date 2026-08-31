@@ -16,7 +16,9 @@ A fast, lightweight calendar and clock status bar plugin for Omarchy that syncs 
 
 ## Features
 
+- **Two-Way Event Sync & Creation**: Add (`󰐕` or `n` hotkey) and delete (`󰆴`) events directly from your desktop into writable calendars (**Google Calendar API**, **JMAP / Fastmail / Stalwart**, and **Local Offline Calendars**).
 - **Universal iCalendar & JMAP Support**: Compatible with any calendar service providing an `.ics` / `webcal://` link (Google, Apple iCloud, Proton, Outlook / Office 365, Nextcloud, generic iCal) or modern **JMAP** API (Fastmail, Stalwart, Cyrus IMAP, Apache James).
+- **Offline Local Calendar**: Create and manage local events stored in `~/.local/state/omarchy/local-events.json` without needing any external cloud account.
 - **One-Click "Join Meeting"**: Automatically detects Google Meet, Zoom, Microsoft Teams, Webex, and Jitsi links in event details and displays an instant join button.
 - **Staged & Configurable Notifications**: Native alerts prior to upcoming meetings with smart staged reminders (10m, 5m, 1m before) or single intervals (5m, 10m, 15m, 30m).
 - **Copy Agenda as Markdown**: 1-click clipboard export (`󰆏` button or `y` hotkey) to format your daily schedule into clean Markdown tasks for standups, Slack, or Obsidian.
@@ -28,6 +30,18 @@ A fast, lightweight calendar and clock status bar plugin for Omarchy that syncs 
 - **Visual Event Indicators**: Days with events show subtle colored dots corresponding to the calendar source.
 - **Fast & Non-Blocking**: Background multi-threaded event fetcher with zero UI freezes.
 - **Recurring & Multi-Day Events**: Full support for daily, weekly, monthly, and yearly recurring events (`RRULE` / `EXDATE`) and multi-day spans.
+
+### Keyboard Shortcuts
+
+| Key | Action |
+| --- | --- |
+| `n` / `N` | **New Event**: Open event creation modal for the selected date |
+| `y` / `Y` | **Copy Agenda**: Export day's events to clipboard as Markdown tasks |
+| `t` / `T` | **Today**: Jump to current date |
+| `[` / `]` | **Month**: Previous / Next month |
+| `{` / `}` | **Year**: Previous / Next year |
+| `w` / `W` | **Week Start**: Toggle Monday / Sunday week start |
+| `Esc` | **Close**: Dismiss Add Event modal, Settings drawer, or Calendar popup |
 
 ## Installation
 

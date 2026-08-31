@@ -350,6 +350,65 @@ function formatAgendaMarkdown(events, selectedDateLabel, calendarName) {
   return lines.join("\n")
 }
 
+function getWritableCalendars(configuredList) {
+  var list = configuredList || []
+  var writables = []
+  var hasLocal = false
+  for (var i = 0; i < list.length; i++) {
+    var c = list[i]
+    if (!c || c.enabled === false) continue
+    var type = String(c.type || "").toLowerCase()
+    if (type === "local") {
+      hasLocal = true
+      writables.push({
+        name: c.name || "Local Calendar",
+        type: "local",
+        color: c.color || "#a6e3a1",
+        calendarId: "local",
+        writable: true
+      })
+    } else if (type === "jmap" || c.jmapToken) {
+      writables.push({
+        name: c.name || "JMAP",
+        type: "jmap",
+        color: c.color || "#ff7700",
+        calendarId: c.jmapCalendarId || c.calendarId || "primary",
+        writable: true
+      })
+    } else if (c.googleCalendarId || (c.calendarId && !c.url)) {
+      writables.push({
+        name: c.name || "Google Calendar",
+        type: "google",
+        color: c.color || "#4285f4",
+        calendarId: c.googleCalendarId || c.calendarId,
+        writable: true
+      })
+    }
+  }
+  if (!hasLocal) {
+    writables.push({
+      name: "Local Calendar",
+      type: "local",
+      color: "#a6e3a1",
+      calendarId: "local",
+      writable: true
+    })
+  }
+  return writables
+}
+
+function calculateEndTime(startTimeStr, durationMinutes) {
+  if (!startTimeStr || startTimeStr.indexOf(":") === -1) return "10:00"
+  var parts = startTimeStr.split(":")
+  var h = parseInt(parts[0], 10)
+  var m = parseInt(parts[1], 10)
+  if (isNaN(h) || isNaN(m)) return "10:00"
+  var total = h * 60 + m + (durationMinutes || 60)
+  var endH = Math.floor(total / 60) % 24
+  var endM = total % 60
+  return pad2(endH) + ":" + pad2(endM)
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
     dateKey: dateKey,
@@ -380,6 +439,8 @@ if (typeof module !== "undefined") {
     CALENDAR_COLORS: CALENDAR_COLORS,
     cycleCalendarColor: cycleCalendarColor,
     parseCalendarsConfig: parseCalendarsConfig,
-    formatAgendaMarkdown: formatAgendaMarkdown
+    formatAgendaMarkdown: formatAgendaMarkdown,
+    getWritableCalendars: getWritableCalendars,
+    calculateEndTime: calculateEndTime
   }
 }
