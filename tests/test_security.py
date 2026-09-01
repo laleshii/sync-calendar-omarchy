@@ -163,6 +163,35 @@ class JmapTransportTests(unittest.TestCase):
         self.assertTrue(response.closed)
 
 
+class StdinPayloadTests(unittest.TestCase):
+    def test_pretty_printed_payload_from_the_ui_is_read_whole(self):
+        payload = json.dumps([{"name": "Work", "url": "https://calendar.example/a.ics"}], indent=2)
+        with mock.patch.object(fetch_events.sys, "stdin", io.StringIO(payload + "\n")):
+            self.assertEqual(json.loads(fetch_events.read_stdin_payload()), json.loads(payload))
+
+    def test_compact_payload_still_returns_on_the_first_line(self):
+        payload = json.dumps({"title": "Standup"})
+        with mock.patch.object(fetch_events.sys, "stdin", io.StringIO(payload + "\n")):
+            self.assertEqual(json.loads(fetch_events.read_stdin_payload()), {"title": "Standup"})
+
+    def test_reader_returns_without_waiting_for_eof(self):
+        class BlockAfterPayload(io.StringIO):
+            def readline(self, *args):
+                line = super().readline(*args)
+                if not line:
+                    raise AssertionError("reader waited for EOF instead of stopping at valid JSON")
+                return line
+
+        payload = json.dumps([{"name": "Work"}], indent=2)
+        with mock.patch.object(fetch_events.sys, "stdin", BlockAfterPayload(payload + "\n")):
+            self.assertEqual(json.loads(fetch_events.read_stdin_payload()), [{"name": "Work"}])
+
+    def test_oversize_payload_is_bounded(self):
+        payload = json.dumps([{"name": "x" * 5000}], indent=2)
+        with mock.patch.object(fetch_events.sys, "stdin", io.StringIO(payload)):
+            self.assertLessEqual(len(fetch_events.read_stdin_payload(max_bytes=256)), 257)
+
+
 class FeedTransportTests(unittest.TestCase):
     @staticmethod
     def _addrinfo(ip):

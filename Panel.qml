@@ -67,6 +67,7 @@ Panel {
   property string eventDescription: ""
   property bool eventSubmitting: false
   property string eventErrorMessage: ""
+  property string calendarErrorMessage: ""
   property string pendingEventPayloadJson: ""
   property string pendingDeletePayloadJson: ""
   readonly property var writableCalendars: Model.getWritableCalendars(root.configuredCalendars)
@@ -180,6 +181,7 @@ Panel {
   }
 
   function saveCalendars(list) {
+    calendarErrorMessage = ""
     pendingConfigJson = JSON.stringify(list, null, 2)
     saveConfigProc.command = [
       "python3",
@@ -215,6 +217,7 @@ Panel {
 
   function startAddingCalendar(type) {
     root.settingsTab = "calendars"
+    calendarErrorMessage = ""
     formName = ""
     formType = type || "url"
     formAddress = ""
@@ -594,7 +597,26 @@ Panel {
     onStarted: {
       write(root.pendingConfigJson + "\n")
     }
+    onExited: function(exitCode, exitStatus) {
+      if (exitCode !== 0) {
+        var detail = (saveConfigErr.text || "").trim()
+        if (!detail) {
+          try {
+            detail = JSON.parse((saveConfigOut.text || "").trim()).message || ""
+          } catch (e) {
+            detail = ""
+          }
+        }
+        root.calendarErrorMessage = "Could not save calendars" + (detail ? ": " + detail : " (exit " + exitCode + ")")
+        console.warn("promaa.clock: --save-config failed, exit " + exitCode + " " + detail)
+      }
+    }
+    stderr: StdioCollector {
+      id: saveConfigErr
+      waitForEnd: true
+    }
     stdout: StdioCollector {
+      id: saveConfigOut
       waitForEnd: true
       onStreamFinished: {
         root.pendingConfigJson = ""
@@ -2474,6 +2496,18 @@ Panel {
                   }
                 }
 
+              }
+
+              Text {
+                visible: root.calendarErrorMessage.length > 0
+                width: parent.width
+                wrapMode: Text.WordWrap
+                textFormat: Text.PlainText
+                text: root.calendarErrorMessage
+                color: "#f38ba8"
+                font.family: root.contentFontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
               }
 
               // Form Action Buttons

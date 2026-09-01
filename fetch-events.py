@@ -2481,17 +2481,28 @@ def sync_all_events():
 
 
 def read_stdin_payload(max_bytes=MAX_CONFIG_BYTES):
-    """Read JSON payload from stdin safely without blocking or deadlock."""
-    try:
-        line = sys.stdin.readline()
-        if line and line.strip():
-            return line
-    except Exception:
-        pass
-    try:
-        return sys.stdin.read(max_bytes + 1)
-    except Exception:
-        return ""
+    """Read a JSON payload from stdin, tolerating pretty-printed multi-line input."""
+    chunks = []
+    total = 0
+    while total <= max_bytes:
+        try:
+            line = sys.stdin.readline(max_bytes + 1 - total)
+        except Exception:
+            break
+        if not line:
+            break
+        chunks.append(line)
+        total += len(line)
+        candidate = "".join(chunks).strip()
+        if not candidate:
+            continue
+        # Return as soon as the payload parses so a writer holding stdin open cannot stall us.
+        try:
+            json.loads(candidate)
+            return candidate
+        except ValueError:
+            continue
+    return "".join(chunks)
 
 
 def main():
