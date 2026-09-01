@@ -163,6 +163,86 @@ class JmapTransportTests(unittest.TestCase):
         self.assertTrue(response.closed)
 
 
+class FeedTransportTests(unittest.TestCase):
+    @staticmethod
+    def _addrinfo(ip):
+        return [(0, 0, 0, "", (ip, 0))]
+
+    def _resolving_to(self, ip):
+        return mock.patch.object(fetch_events.socket, "getaddrinfo", return_value=self._addrinfo(ip))
+
+    def test_only_credential_free_https_feeds_on_public_hosts_are_accepted(self):
+        with self._resolving_to("93.184.216.34"):
+            self.assertEqual(
+                fetch_events.validate_feed_https_url("https://calendar.example/basic.ics"),
+                "https://calendar.example/basic.ics",
+            )
+            for url in (
+                "http://calendar.example/basic.ics",
+                "https://user:pass@calendar.example/basic.ics",
+                "https://calendar.example\\@attacker.example/basic.ics",
+                "ftp://calendar.example/basic.ics",
+            ):
+                with self.subTest(url=url), self.assertRaises(ValueError):
+                    fetch_events.validate_feed_https_url(url)
+
+    def test_feeds_resolving_to_private_space_are_rejected(self):
+        for ip in ("127.0.0.1", "10.0.0.5", "192.168.1.10", "169.254.169.254", "::1", "fd00::1"):
+            with self.subTest(ip=ip), self._resolving_to(ip):
+                with self.assertRaises(ValueError) as caught:
+                    fetch_events.validate_feed_https_url("https://calendar.example/basic.ics")
+                self.assertIn("non-public address", str(caught.exception))
+
+    def test_redirect_onto_private_address_is_refused(self):
+        handler = fetch_events.FeedRedirectHandler()
+        with self._resolving_to("169.254.169.254"), self.assertRaises(ValueError):
+            handler.redirect_request(None, None, 302, "Found", {}, "https://metadata.example/latest")
+
+    def test_plaintext_feed_is_rejected_before_any_request(self):
+        calendar = {"name": "unsafe", "url": "http://calendar.example/basic.ics"}
+        with mock.patch.object(fetch_events.urllib.request, "build_opener") as build_opener:
+            result = fetch_events.fetch_calendar(calendar, fetch_events.datetime.now(), fetch_events.datetime.now())
+        build_opener.assert_not_called()
+        self.assertIn("must use HTTPS", result["status"])
+
+    def test_relative_path_is_treated_as_a_host_not_a_local_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            secret = os.path.join(directory, "secrets.ics")
+            with open(secret, "w", encoding="utf-8") as stream:
+                stream.write("BEGIN:VCALENDAR\nEND:VCALENDAR\n")
+            cwd = os.getcwd()
+            os.chdir(directory)
+            try:
+                calendar = {"name": "sneaky", "url": "secrets.ics"}
+                with mock.patch.object(fetch_events.urllib.request, "build_opener") as build_opener:
+                    result = fetch_events.fetch_calendar(
+                        calendar, fetch_events.datetime.now(), fetch_events.datetime.now()
+                    )
+                build_opener.assert_not_called()
+                self.assertIn("could not be resolved", result["status"])
+            finally:
+                os.chdir(cwd)
+
+    def test_absolute_local_path_still_loads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "local.ics")
+            with open(path, "w", encoding="utf-8") as stream:
+                stream.write("BEGIN:VCALENDAR\nEND:VCALENDAR\n")
+            result = fetch_events.fetch_calendar(
+                {"name": "local", "url": path}, fetch_events.datetime.now(), fetch_events.datetime.now()
+            )
+            self.assertEqual(result["status"], "ok")
+
+    def test_group_and_world_readable_secret_files_are_tightened(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "calendars.json")
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump([{"name": "x", "jmapToken": "secret"}], stream)
+            os.chmod(path, 0o644)
+            fetch_events.harden_secret_file_mode(path)
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+
+
 class MeetingUrlSecurityTests(unittest.TestCase):
     def test_validate_meeting_url_accepts_clean_http_and_https_urls(self):
         valid_urls = [

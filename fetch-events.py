@@ -10,6 +10,8 @@ import sys
 import json
 import re
 import secrets
+import socket
+import ipaddress
 import stat
 import time
 import calendar
@@ -231,8 +233,25 @@ def translate_korean_to_english(text):
     return text
 
 
+def harden_secret_file_mode(path):
+    """Drop group/other access from a secret-bearing file that a hand edit left readable."""
+    try:
+        info = os.stat(path, follow_symlinks=False)
+    except OSError:
+        return
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+        return
+    if stat.S_IMODE(info.st_mode) & 0o077:
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+
+
 def ensure_config_exists():
     """Create a default sample config if it does not exist."""
+    harden_secret_file_mode(CONFIG_PATH)
+    harden_secret_file_mode(AUTH_FILE)
     try:
         existing = safe_load_json(CONFIG_PATH, max_bytes=MAX_CONFIG_BYTES)
     except (json.JSONDecodeError, OSError, ValueError):
@@ -1173,6 +1192,65 @@ def fetch_google_api_calendar(cal_info, window_start, window_end):
         }
 
 
+def assert_public_host(hostname):
+    """Reject hosts resolving to loopback, private, link-local, or otherwise reserved space."""
+    try:
+        infos = socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
+    except socket.gaierror as exc:
+        raise ValueError(f"Feed hostname could not be resolved: {hostname}") from exc
+    if not infos:
+        raise ValueError(f"Feed hostname could not be resolved: {hostname}")
+    for info in infos:
+        address = ipaddress.ip_address(info[4][0])
+        if not address.is_global or address.is_multicast:
+            raise ValueError(f"Feed host resolves to a non-public address: {address}")
+
+
+def validate_feed_https_url(url):
+    """Return a validated credential-free HTTPS feed URL pointing at a public host."""
+    if not isinstance(url, str) or not url or any(ord(char) < 0x20 for char in url) or "\\" in url:
+        raise ValueError("Feed URL is invalid")
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("Feed URL is invalid") from exc
+    if port is not None and not 0 < port <= 65535:
+        raise ValueError("Feed URL port is invalid")
+    if parsed.scheme.lower() != "https" or not parsed.hostname:
+        raise ValueError("Feed URL must use HTTPS")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("Feed URL must not contain credentials")
+    try:
+        hostname = parsed.hostname.rstrip(".").encode("idna").decode("ascii").lower()
+    except UnicodeError as exc:
+        raise ValueError("Feed URL hostname is invalid") from exc
+    assert_public_host(hostname)
+    return url
+
+
+class FeedRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Re-validate every hop so a feed cannot be bounced onto a private address."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        validate_feed_https_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def open_trusted_feed(url, timeout=12):
+    """Open a validated feed URL and re-check the final URL after any redirects."""
+    validate_feed_https_url(url)
+    opener = urllib.request.build_opener(FeedRedirectHandler())
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    response = opener.open(request, timeout=timeout)
+    try:
+        validate_feed_https_url(response.geturl())
+    except Exception:
+        response.close()
+        raise
+    return response
+
+
 def fetch_calendar(cal_info, window_start, window_end):
     """Fetch single calendar from URL or local file."""
     name = cal_info.get("name", "Calendar")
@@ -1189,9 +1267,10 @@ def fetch_calendar(cal_info, window_start, window_end):
     elif raw_url.startswith("http://") or raw_url.startswith("https://") or raw_url.startswith("file://"):
         url = raw_url
     else:
-        # Fallback to https:// or local path
-        if os.path.exists(os.path.expanduser(raw_url)):
-            url = os.path.expanduser(raw_url)
+        # Rooted paths only: a bare relative string must not become a read of a file near the CWD.
+        expanded = os.path.expanduser(raw_url)
+        if raw_url.startswith(("/", "~")) and os.path.exists(expanded):
+            url = expanded
         else:
             url = "https://" + raw_url
 
@@ -1201,8 +1280,7 @@ def fetch_calendar(cal_info, window_start, window_end):
             with open(path, "r", encoding="utf-8", errors="ignore") as f:
                 content = safe_read_text(f, max_bytes=MAX_ICAL_BYTES)
         else:
-            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-            with urllib.request.urlopen(req, timeout=12) as resp:
+            with open_trusted_feed(url) as resp:
                 raw = safe_read_bytes(resp, max_bytes=MAX_ICAL_BYTES)
                 content = raw.decode("utf-8", errors="ignore")
 
