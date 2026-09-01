@@ -1,6 +1,7 @@
 import QtQuick
 import Quickshell
 import Quickshell.Io
+import Quickshell.Wayland
 import qs.Commons
 import qs.Ui
 import "Model.js" as Model
@@ -41,6 +42,14 @@ Panel {
   readonly property bool syncRunning: fetchProc.running
   readonly property bool notifyUpcomingEvents: root.setting("notifyUpcomingEvents", true)
   readonly property var notifyMinutesBefore: root.setting("notifyMinutesBefore", "staged")
+
+  // ---- Urgent alerts. Deliberately independent of notifyUpcomingEvents and of
+  //      notify-send: this draws on a surface the plugin owns, so a meeting on an
+  //      opted-in calendar still breaks through while notifications are silenced.
+  readonly property int alertLeadMinutes: Math.max(1, parseInt(root.setting("alertLeadMinutes", 1)) || 1)
+  readonly property int alertLingerMinutes: 5
+  property var alertDismissed: ({})
+  property var activeAlerts: []
   readonly property int syncIntervalMinutes: root.setting("syncIntervalMinutes", 15)
   readonly property bool enableMeetingLinks: root.setting("enableMeetingLinks", true)
   property var notifiedEventKeys: ({})
@@ -203,6 +212,14 @@ Panel {
     var list = JSON.parse(JSON.stringify(root.configuredCalendars))
     if (index >= 0 && index < list.length) {
       list.splice(index, 1)
+      saveCalendars(list)
+    }
+  }
+
+  function toggleCalendarAlert(index) {
+    var list = JSON.parse(JSON.stringify(root.configuredCalendars))
+    if (index >= 0 && index < list.length) {
+      list[index].alert = list[index].alert !== true
       saveCalendars(list)
     }
   }
@@ -406,6 +423,57 @@ Panel {
     }
   }
 
+  function checkUrgentAlerts() {
+    var todayEvents = root.eventsByDate[root.todayKey] || []
+    var nowMs = Date.now()
+    var next = []
+
+    for (var i = 0; i < todayEvents.length; i++) {
+      var evt = todayEvents[i]
+      if (!evt.alert || evt.allDay || !evt.startIso) continue
+      var startMs = new Date(evt.startIso).getTime()
+      if (isNaN(startMs)) continue
+
+      // Show from the lead time until the meeting has been running a few minutes,
+      // so looking away for a moment does not mean missing it entirely.
+      var diffMs = startMs - nowMs
+      if (diffMs > root.alertLeadMinutes * 60000) continue
+      if (diffMs < -root.alertLingerMinutes * 60000) continue
+
+      var key = evt.id + "_" + evt.startIso
+      if (root.alertDismissed[key]) continue
+
+      next.push({
+        key: key,
+        title: evt.title || "Untitled event",
+        calendar: evt.calendar || "",
+        color: evt.color || Color.accent,
+        startTime: evt.startTime || "",
+        endTime: evt.endTime || "",
+        location: evt.location || "",
+        meetingUrl: evt.meetingUrl || "",
+        meetingProvider: evt.meetingProvider || "",
+        minutesAway: Math.round(diffMs / 60000)
+      })
+    }
+    root.activeAlerts = next
+  }
+
+  function dismissAlert(key) {
+    if (!key) return
+    var updated = Object.assign({}, root.alertDismissed)
+    updated[key] = true
+    root.alertDismissed = updated
+    root.checkUrgentAlerts()
+  }
+
+  function alertHeadline(alert) {
+    if (!alert) return ""
+    if (alert.minutesAway <= 0) return "Starting now"
+    if (alert.minutesAway === 1) return "Starting in 1 minute"
+    return "Starting in " + alert.minutesAway + " minutes"
+  }
+
   function copyAgendaMarkdown() {
     var events = root.displayedEvents
     if (!events || events.length === 0) return
@@ -556,6 +624,7 @@ Panel {
     onFileChanged: {
       reload()
       root.checkUpcomingNotifications()
+      root.checkUrgentAlerts()
     }
   }
 
@@ -688,6 +757,148 @@ Panel {
     interval: 2000
     repeat: false
     onTriggered: root.agendaCopied = false
+  }
+
+  // Ten seconds keeps a one-minute lead honest; a 30s tick could fire at 30s.
+  Timer {
+    id: alertCheckTimer
+    interval: 10000
+    repeat: true
+    running: true
+    triggeredOnStart: true
+    onTriggered: root.checkUrgentAlerts()
+  }
+
+  // The alert lives on its own layer-shell surface rather than going through
+  // notify-send, which is what lets it appear while notifications are silenced.
+  PanelWindow {
+    id: alertSurface
+    visible: root.activeAlerts.length > 0
+    color: "transparent"
+    anchors { top: true; left: true; right: true }
+    implicitHeight: alertColumn.implicitHeight + Style.space(12)
+    exclusiveZone: 0
+    WlrLayershell.namespace: "omarchy-calendar-alert"
+    WlrLayershell.layer: WlrLayer.Overlay
+    WlrLayershell.keyboardFocus: WlrKeyboardFocus.None
+
+    Column {
+      id: alertColumn
+      anchors.horizontalCenter: parent.horizontalCenter
+      anchors.top: parent.top
+      anchors.topMargin: (root.bar && root.bar.barSize ? root.bar.barSize : Style.bar.sizeHorizontal) + Style.space(6)
+      spacing: Style.space(6)
+
+      Repeater {
+        model: root.activeAlerts
+
+        Rectangle {
+          id: alertCard
+          required property var modelData
+
+          width: Math.min(460, Screen.width - Style.space(40))
+          implicitHeight: alertBody.implicitHeight + Style.space(20)
+          height: implicitHeight
+          radius: Style.cornerRadius
+          color: Color.background
+          border.width: 1
+          border.color: alertCard.modelData.color || Color.accent
+
+          Rectangle {
+            id: alertStripe
+            anchors.left: parent.left
+            anchors.top: parent.top
+            anchors.bottom: parent.bottom
+            anchors.margins: 1
+            width: Style.space(4)
+            radius: Style.cornerRadius
+            color: alertCard.modelData.color || Color.accent
+          }
+
+          Row {
+            id: alertBody
+            anchors.left: alertStripe.right
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            anchors.leftMargin: Style.space(10)
+            anchors.rightMargin: Style.space(10)
+            spacing: Style.space(10)
+
+            Column {
+              width: parent.width - alertActions.width - Style.space(10)
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: Style.space(2)
+
+              Text {
+                textFormat: Text.PlainText
+                text: root.alertHeadline(alertCard.modelData)
+                color: alertCard.modelData.color || Color.accent
+                font.family: root.contentFontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+              }
+
+              Text {
+                textFormat: Text.PlainText
+                text: alertCard.modelData.title
+                color: root.contentForeground
+                font.family: root.contentFontFamily
+                font.pixelSize: Style.font.body
+                font.bold: true
+                elide: Text.ElideRight
+                width: parent.width
+              }
+
+              Text {
+                textFormat: Text.PlainText
+                text: {
+                  var bits = []
+                  if (alertCard.modelData.calendar) bits.push(alertCard.modelData.calendar)
+                  if (alertCard.modelData.startTime) {
+                    bits.push(alertCard.modelData.startTime
+                      + (alertCard.modelData.endTime ? " - " + alertCard.modelData.endTime : ""))
+                  }
+                  if (alertCard.modelData.meetingProvider) bits.push(alertCard.modelData.meetingProvider)
+                  else if (alertCard.modelData.location) bits.push(alertCard.modelData.location)
+                  return bits.join("  ·  ")
+                }
+                color: Qt.darker(root.contentForeground, 1.6)
+                font.family: root.contentFontFamily
+                font.pixelSize: Style.font.caption
+                elide: Text.ElideRight
+                width: parent.width
+              }
+            }
+
+            Row {
+              id: alertActions
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: Style.space(4)
+
+              PanelActionButton {
+                visible: String(alertCard.modelData.meetingUrl || "") !== ""
+                iconText: "󰖟"
+                tooltipText: "Join meeting"
+                foreground: root.contentForeground
+                fontFamily: root.contentFontFamily
+                onClicked: {
+                  root.openExternalUrl(alertCard.modelData.meetingUrl)
+                  root.dismissAlert(alertCard.modelData.key)
+                }
+              }
+
+              PanelActionButton {
+                iconText: "󰅖"
+                tooltipText: "Dismiss"
+                foreground: root.contentForeground
+                fontFamily: root.contentFontFamily
+                onClicked: root.dismissAlert(alertCard.modelData.key)
+              }
+            }
+          }
+        }
+      }
+    }
   }
 
   SystemClock {
@@ -2696,6 +2907,18 @@ Panel {
                       elide: Text.ElideMiddle
                       width: parent.width
                     }
+                  }
+
+                  // Urgent alert opt-in. Per calendar, so "work only" is expressible.
+                  PanelActionButton {
+                    anchors.verticalCenter: parent.verticalCenter
+                    iconText: modelData.alert === true ? "󰂚" : "󰂛"
+                    tooltipText: modelData.alert === true
+                      ? "Urgent alerts on: shows a popup even when notifications are off"
+                      : "Urgent alerts off"
+                    foreground: modelData.alert === true ? Color.accent : Qt.darker(root.contentForeground, 1.7)
+                    fontFamily: root.contentFontFamily
+                    onClicked: root.toggleCalendarAlert(calItemRow.index)
                   }
 
                   // Delete button

@@ -2418,17 +2418,22 @@ def sync_all_events():
     if enabled_cals:
         with ThreadPoolExecutor(max_workers=min(8, len(enabled_cals))) as executor:
             futures = [
-                executor.submit(fetch_calendar_item, c, window_start, window_end)
+                (c, executor.submit(fetch_calendar_item, c, window_start, window_end))
                 for c in enabled_cals
             ]
-            for f in futures:
+            for cal_info, f in futures:
                 res = f.result()
+                alert = bool(cal_info.get("alert", False))
+                if alert:
+                    for evt in res["events"]:
+                        evt["alert"] = True
                 all_events.extend(res["events"])
                 cal_statuses.append({
                     "name": res["name"],
                     "color": res["color"],
                     "type": res.get("type", "ical"),
                     "writable": bool(res.get("writable", False)),
+                    "alert": alert,
                     "status": res["status"],
                     "count": res["count"],
                 })
@@ -2449,6 +2454,7 @@ def sync_all_events():
             "calendarId": evt.get("calendarId", ""),
             "calendarType": evt.get("calendarType", "ical"),
             "writable": bool(evt.get("writable", False)),
+            "alert": bool(evt.get("alert", False)),
             "description": evt.get("description", ""),
             "color": evt["color"],
             "allDay": evt["all_day"],

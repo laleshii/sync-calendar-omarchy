@@ -163,6 +163,62 @@ class JmapTransportTests(unittest.TestCase):
         self.assertTrue(response.closed)
 
 
+class UrgentAlertPropagationTests(unittest.TestCase):
+    def _run_sync(self, calendars):
+        def fake_fetch(cal_info, window_start, window_end):
+            return {
+                "name": cal_info["name"],
+                "color": "#ffffff",
+                "status": "ok",
+                "count": 1,
+                "events": [{
+                    "id": cal_info["name"] + "-1",
+                    "title": "Standup",
+                    "calendar": cal_info["name"],
+                    "color": "#ffffff",
+                    "all_day": False,
+                    "start_dt": fetch_events.datetime(2026, 9, 1, 10, 0),
+                    "end_dt": fetch_events.datetime(2026, 9, 1, 10, 30),
+                    "date_key": "2026-09-01",
+                    "location": "",
+                }],
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            state = os.path.join(directory, "state")
+            os.makedirs(state)
+            with mock.patch.object(fetch_events, "CONFIG_PATH", os.path.join(directory, "calendars.json")), \
+                 mock.patch.object(fetch_events, "STATE_DIR", state), \
+                 mock.patch.object(fetch_events, "OUTPUT_PATH", os.path.join(state, "events.json")), \
+                 mock.patch.object(fetch_events, "LOCAL_EVENTS_PATH", os.path.join(state, "local.json")), \
+                 mock.patch.object(fetch_events, "AUTH_FILE", os.path.join(state, "auth.json")), \
+                 mock.patch.object(fetch_events, "TRANSLATION_CACHE_PATH", os.path.join(state, "tr.json")), \
+                 mock.patch.object(fetch_events, "fetch_calendar_item", fake_fetch):
+                fetch_events.write_secure_json(fetch_events.CONFIG_PATH, calendars)
+                fetch_events.sync_all_events()
+                return fetch_events.safe_load_json(
+                    fetch_events.OUTPUT_PATH, max_bytes=fetch_events.MAX_OUTPUT_JSON_BYTES
+                )
+
+    def test_alert_opt_in_reaches_events_and_calendar_status(self):
+        out = self._run_sync([
+            {"name": "Work", "url": "https://cal.example/w.ics", "enabled": True, "alert": True},
+            {"name": "Personal", "url": "https://cal.example/p.ics", "enabled": True},
+        ])
+        by_name = {c["name"]: c for c in out["calendars"]}
+        self.assertTrue(by_name["Work"]["alert"])
+        self.assertFalse(by_name["Personal"]["alert"])
+
+        events = {e["calendar"]: e for e in out["eventsByDate"]["2026-09-01"]}
+        self.assertTrue(events["Work"]["alert"])
+        self.assertFalse(events["Personal"]["alert"])
+
+    def test_alert_defaults_off_when_unset(self):
+        out = self._run_sync([{"name": "Solo", "url": "https://cal.example/s.ics", "enabled": True}])
+        self.assertFalse(out["calendars"][0]["alert"])
+        self.assertFalse(out["eventsByDate"]["2026-09-01"][0]["alert"])
+
+
 class RecurrenceOverrideTests(unittest.TestCase):
     WINDOW_START = fetch_events.datetime(2026, 5, 1)
     WINDOW_END = fetch_events.datetime(2026, 6, 1)
