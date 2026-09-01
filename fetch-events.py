@@ -903,6 +903,7 @@ def parse_ics(content, cal_info, window_start, window_end):
     """
     lines = unfold_lines(content)
     raw_events = []
+    overridden_instances = {}
     in_vevent = False
     current = {}
 
@@ -912,9 +913,14 @@ def parse_ics(content, cal_info, window_start, window_end):
             current = {"exdates": []}
             continue
         elif line == "END:VEVENT":
-            if in_vevent and "DTSTART" in current:
-                # Skip cancelled events
-                if current.get("STATUS", "").upper() != "CANCELLED":
+            if in_vevent:
+                # RFC 5545: a RECURRENCE-ID component replaces the instance its parent RRULE
+                # generates for that date, so record it even when cancelled, which is how a
+                # single deleted occurrence arrives.
+                rec_dt = current.get("RECURRENCE_ID")
+                if rec_dt and current.get("UID"):
+                    overridden_instances.setdefault(current["UID"], set()).add(rec_dt.strftime("%Y-%m-%d"))
+                if "DTSTART" in current and current.get("STATUS", "").upper() != "CANCELLED":
                     raw_events.append(current)
             in_vevent = False
             current = {}
@@ -953,6 +959,9 @@ def parse_ics(content, cal_info, window_start, window_end):
             current["URL"] = val_part.strip()
         elif prop_name == "RRULE":
             current["RRULE"] = parse_rrule(val_part)
+        elif prop_name == "RECURRENCE-ID":
+            _, rec_dt = parse_datetime_value(val_part, prop_params)
+            current["RECURRENCE_ID"] = rec_dt
         elif prop_name == "EXDATE":
             for ex_val in val_part.split(","):
                 ex_val = ex_val.strip()
@@ -984,6 +993,10 @@ def parse_ics(content, cal_info, window_start, window_end):
             f"{location} {raw_url}", description, title
         )
 
+        event_exdates = list(raw.get("exdates", []))
+        if raw.get("RRULE") and not raw.get("RECURRENCE_ID"):
+            event_exdates.extend(overridden_instances.get(raw.get("UID"), ()))
+
         evt = {
             "id": raw.get("UID", f"evt_{int(start_dt.timestamp())}"),
             "title": title,
@@ -998,7 +1011,7 @@ def parse_ics(content, cal_info, window_start, window_end):
             "meetingUrl": meeting_url or "",
             "meetingProvider": meeting_provider or "",
             "rrule": raw.get("RRULE"),
-            "exdates": raw.get("exdates", []),
+            "exdates": event_exdates,
         }
 
         if evt["rrule"]:

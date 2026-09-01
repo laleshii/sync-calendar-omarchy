@@ -163,6 +163,74 @@ class JmapTransportTests(unittest.TestCase):
         self.assertTrue(response.closed)
 
 
+class RecurrenceOverrideTests(unittest.TestCase):
+    WINDOW_START = fetch_events.datetime(2026, 5, 1)
+    WINDOW_END = fetch_events.datetime(2026, 6, 1)
+
+    def parse(self, body):
+        ics = "BEGIN:VCALENDAR\n" + body + "END:VCALENDAR\n"
+        return fetch_events.parse_ics(ics, {"name": "Cal"}, self.WINDOW_START, self.WINDOW_END)
+
+    MASTER = (
+        "BEGIN:VEVENT\n"
+        "UID:series@example.com\n"
+        "DTSTART:20260501T100000\n"
+        "DTEND:20260501T103000\n"
+        "RRULE:FREQ=WEEKLY;BYDAY=FR\n"
+        "SUMMARY:Weekly Sync\n"
+        "END:VEVENT\n"
+    )
+
+    def test_override_replaces_the_generated_instance_instead_of_duplicating_it(self):
+        override = (
+            "BEGIN:VEVENT\n"
+            "UID:series@example.com\n"
+            "RECURRENCE-ID:20260508T100000\n"
+            "DTSTART:20260508T100000\n"
+            "DTEND:20260508T103000\n"
+            "SUMMARY:Weekly Sync (moved room)\n"
+            "END:VEVENT\n"
+        )
+        events = self.parse(self.MASTER + override)
+        on_day = [e for e in events if e["date_key"] == "2026-05-08"]
+        self.assertEqual(len(on_day), 1)
+        self.assertEqual(on_day[0]["title"], "Weekly Sync (moved room)")
+
+    def test_cancelled_occurrence_does_not_reappear_from_the_series(self):
+        cancelled = (
+            "BEGIN:VEVENT\n"
+            "UID:series@example.com\n"
+            "RECURRENCE-ID:20260515T100000\n"
+            "DTSTART:20260515T100000\n"
+            "STATUS:CANCELLED\n"
+            "SUMMARY:Weekly Sync\n"
+            "END:VEVENT\n"
+        )
+        events = self.parse(self.MASTER + cancelled)
+        self.assertEqual([e for e in events if e["date_key"] == "2026-05-15"], [])
+
+    def test_override_moved_to_another_day_clears_its_original_slot(self):
+        moved = (
+            "BEGIN:VEVENT\n"
+            "UID:series@example.com\n"
+            "RECURRENCE-ID:20260522T100000\n"
+            "DTSTART:20260523T140000\n"
+            "DTEND:20260523T143000\n"
+            "SUMMARY:Weekly Sync (rescheduled)\n"
+            "END:VEVENT\n"
+        )
+        events = self.parse(self.MASTER + moved)
+        self.assertEqual([e for e in events if e["date_key"] == "2026-05-22"], [])
+        landed = [e for e in events if e["date_key"] == "2026-05-23"]
+        self.assertEqual(len(landed), 1)
+        self.assertEqual(landed[0]["title"], "Weekly Sync (rescheduled)")
+
+    def test_untouched_occurrences_are_still_generated(self):
+        events = self.parse(self.MASTER)
+        days = sorted({e["date_key"] for e in events})
+        self.assertEqual(days, ["2026-05-01", "2026-05-08", "2026-05-15", "2026-05-22", "2026-05-29"])
+
+
 class StdinPayloadTests(unittest.TestCase):
     def test_pretty_printed_payload_from_the_ui_is_read_whole(self):
         payload = json.dumps([{"name": "Work", "url": "https://calendar.example/a.ics"}], indent=2)
