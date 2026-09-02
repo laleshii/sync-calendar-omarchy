@@ -776,7 +776,11 @@ Panel {
     visible: root.activeAlerts.length > 0
     color: "transparent"
     anchors { top: true; left: true; right: true }
-    implicitHeight: alertColumn.implicitHeight + Style.space(12)
+    // The bar's exclusive zone already places this surface below the bar, so the
+    // margin is just a gap -- and it has to be counted in the height or the card
+    // is clipped by however far the column was pushed down.
+    readonly property int alertGap: Style.space(6)
+    implicitHeight: alertGap * 2 + alertColumn.implicitHeight
     exclusiveZone: 0
     WlrLayershell.namespace: "omarchy-calendar-alert"
     WlrLayershell.layer: WlrLayer.Overlay
@@ -786,7 +790,7 @@ Panel {
       id: alertColumn
       anchors.horizontalCenter: parent.horizontalCenter
       anchors.top: parent.top
-      anchors.topMargin: (root.bar && root.bar.barSize ? root.bar.barSize : Style.bar.sizeHorizontal) + Style.space(6)
+      anchors.topMargin: alertSurface.alertGap
       spacing: Style.space(6)
 
       Repeater {
